@@ -1,5 +1,5 @@
 /**
- * Sync Basecamp todos assigned to specific teams into a single sheet.
+ * Sync Basecamp todos assigned to specific teams into a single sheet, including cleaned notes.
  */
 const BASECAMP_ACCOUNT_ID = '5796684';
 
@@ -9,6 +9,19 @@ const FILTER_TEAMS = [
   'Digital Ads Dept.',
   'Creative'
 ];
+
+/**
+ * Strip HTML tags and remove images from a string.
+ */
+function stripHtml(html) {
+  if (!html) return '';
+  // Remove <img> tags entirely
+  const noImages = html.replace(/<img[^>]*>/gi, '');
+  // Remove all remaining HTML tags
+  const textOnly = noImages.replace(/<[^>]+>/g, ' ');
+  // Normalize whitespace
+  return textOnly.replace(/\s+/g, ' ').trim();
+}
 
 /**
  * Main entry: fetch and write todos for FILTER_TEAMS.
@@ -26,7 +39,7 @@ function syncTeamAssignedTasks() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = getOrCreateSheet(ss, '🧑‍💼 Team Assigned Tasks');
   resetSheet(sheet, [
-    'Project', 'Todoset', 'Todolist', 'Todo Item', 'Completed',
+    'Project', 'Todoset', 'Todolist', 'Todo Item', 'Notes', 'Completed',
     'Assigned To', 'Created At', 'Due Date', 'Status', 'Item URL', 'Created By'
   ]);
 
@@ -68,14 +81,14 @@ function syncTeamAssignedTasks() {
 
             todos.forEach(todo => {
               const names = (todo.assignees || []).map(p => p.name);
-              // include only if at least one FILTER_TEAMS member is assigned
               if (!names.some(n => FILTER_TEAMS.includes(n))) return;
 
               rows.push([
                 projectName,
                 todosetData.name || '(Unnamed Todoset)',
                 list.title,
-                todo.content || todo.title || '',
+                todo.content || '',
+                stripHtml(todo.description),
                 todo.completed ? '✅' : '❌',
                 names.join(', '),
                 todo.created_at ? new Date(todo.created_at).toLocaleString() : '',
@@ -93,7 +106,6 @@ function syncTeamAssignedTasks() {
     }
   });
 
-  // write all rows at once
   if (rows.length) {
     sheet.getRange(2, 1, rows.length, rows[0].length).setValues(rows);
   }
