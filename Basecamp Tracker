@@ -1,0 +1,134 @@
+/**
+ * Sync Basecamp todos assigned to specific teams into a single sheet.
+ */
+const BASECAMP_ACCOUNT_ID = '5796684';
+
+// Specify teams to include
+const FILTER_TEAMS = [
+  'Performance Team',
+  'Digital Ads Dept.',
+  'Creative'
+];
+
+/**
+ * Main entry: fetch and write todos for FILTER_TEAMS.
+ */
+function syncTeamAssignedTasks() {
+  const token = PropertiesService.getScriptProperties().getProperty('ACCESS_TOKEN');
+  if (!token) throw new Error('ACCESS_TOKEN not found in Script Properties');
+
+  const headers = {
+    Authorization: 'Bearer ' + token,
+    Accept: 'application/json',
+    'User-Agent': 'Nexus Tickets Tracker (prasanth@ready2ridemobile.com)'
+  };
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = getOrCreateSheet(ss, '🧑‍💼 Team Assigned Tasks');
+  resetSheet(sheet, [
+    'Project', 'Todoset', 'Todolist', 'Todo Item', 'Completed',
+    'Assigned To', 'Created At', 'Due Date', 'Status', 'Item URL', 'Created By'
+  ]);
+
+  const statuses = [
+    { label: 'active', url: `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/projects.json` },
+    { label: 'archived', url: `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/projects.json?status=archived` },
+    { label: 'trashed', url: `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/projects.json?status=trashed` }
+  ];
+
+  const rows = [];
+
+  statuses.forEach(status => {
+    let page = 1;
+    while (true) {
+      const pagedUrl = status.url.includes('?')
+        ? `${status.url}&page=${page}`
+        : `${status.url}?page=${page}`;
+      const projects = fetchJSON(pagedUrl, headers);
+      if (!projects || !projects.length) break;
+
+      projects.forEach(project => {
+        const projectName = project.name;
+        const bucketId = project.id;
+        const todosets = (project.dock || [])
+          .filter(tool => tool.name === 'todoset' && tool.enabled && tool.url);
+
+        todosets.forEach(tool => {
+          const todosetData = fetchJSON(tool.url, headers);
+          if (!todosetData || !todosetData.todolists_url) return;
+
+          const lists = fetchJSON(todosetData.todolists_url, headers);
+          if (!lists || !lists.length) return;
+
+          lists.forEach(list => {
+            const todosUrl = `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/buckets/${bucketId}/todolists/${list.id}/todos.json`;
+            Utilities.sleep(200);
+            const todos = fetchJSON(todosUrl, headers);
+            if (!todos || !todos.length) return;
+
+            todos.forEach(todo => {
+              const names = (todo.assignees || []).map(p => p.name);
+              // include only if at least one FILTER_TEAMS member is assigned
+              if (!names.some(n => FILTER_TEAMS.includes(n))) return;
+
+              rows.push([
+                projectName,
+                todosetData.name || '(Unnamed Todoset)',
+                list.title,
+                todo.content || todo.title || '',
+                todo.completed ? '✅' : '❌',
+                names.join(', '),
+                todo.created_at ? new Date(todo.created_at).toLocaleString() : '',
+                todo.due_on || '',
+                status.label,
+                `https://3.basecamp.com/${BASECAMP_ACCOUNT_ID}/buckets/${bucketId}/todos/${todo.id}`,
+                todo.creator?.name || ''
+              ]);
+            });
+          });
+        });
+      });
+
+      page++;
+    }
+  });
+
+  // write all rows at once
+  if (rows.length) {
+    sheet.getRange(2, 1, rows.length, rows[0].length).setValues(rows);
+  }
+
+  ss.toast('✅ Team-assigned todos synced!', 'Basecamp Sync');
+}
+
+/**
+ * Fetch JSON, return null on failure.
+ */
+function fetchJSON(url, headers) {
+  try {
+    const res = UrlFetchApp.fetch(url, { method: 'get', headers, muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) return null;
+    return JSON.parse(res.getContentText());
+  } catch (e) {
+    Logger.log(`Error fetching ${url}: ${e}`);
+    return null;
+  }
+}
+
+/**
+ * Clear sheet and write header row.
+ */
+function resetSheet(sheet, headers) {
+  sheet.clearContents();
+  sheet.appendRow(headers);
+  sheet.setFrozenRows(1);
+}
+
+/**
+ * Get or create a sheet by name.
+ */
+function getOrCreateSheet(ss, name) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  return sh;
+}
