@@ -1,7 +1,11 @@
 /**
- * Sync Basecamp todos assigned to specific teams into a single sheet, including cleaned notes.
+ * Sync Basecamp todos assigned to specific teams into a single sheet, including cleaned notes,
+ * support marking tasks done from the sheet, and send Teams notifications.
  */
 const BASECAMP_ACCOUNT_ID = '5796684';
+
+// Teams webhook URL stored in Script Properties as TEAMS_WEBHOOK_URL
+const TEAMS_WEBHOOK_URL = PropertiesService.getScriptProperties().getProperty('TEAMS_WEBHOOK_URL');
 
 // Specify teams to include
 const FILTER_TEAMS = [
@@ -11,16 +15,28 @@ const FILTER_TEAMS = [
 ];
 
 /**
+ * Send a plain-text notification to the Teams channel via webhook.
+ */
+function sendTeamsNotification(message) {
+  if (!TEAMS_WEBHOOK_URL) return;
+  try {
+    UrlFetchApp.fetch(TEAMS_WEBHOOK_URL, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify({ text: message })
+    });
+  } catch (e) {
+    Logger.log(`Failed to send Teams notification: ${e}`);
+  }
+}
+
+/**
  * Strip HTML tags and remove images from a string.
  */
 function stripHtml(html) {
   if (!html) return '';
-  // Remove <img> tags entirely
   const noImages = html.replace(/<img[^>]*>/gi, '');
-  // Remove all remaining HTML tags
-  const textOnly = noImages.replace(/<[^>]+>/g, ' ');
-  // Normalize whitespace
-  return textOnly.replace(/\s+/g, ' ').trim();
+  return noImages.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 /**
@@ -40,7 +56,7 @@ function syncTeamAssignedTasks() {
   const sheet = getOrCreateSheet(ss, '🧑‍💼 Team Assigned Tasks');
   resetSheet(sheet, [
     'Project', 'Todoset', 'Todolist', 'Todo Item', 'Notes', 'Completed',
-    'Assigned To', 'Created At', 'Due Date', 'Status', 'Item URL', 'Created By'
+    'Assigned To', 'Created At', 'Due Date', 'Status', 'Item URL', 'Created By', 'Mark Done'
   ]);
 
   const statuses = [
@@ -95,22 +111,64 @@ function syncTeamAssignedTasks() {
                 todo.due_on || '',
                 status.label,
                 `https://3.basecamp.com/${BASECAMP_ACCOUNT_ID}/buckets/${bucketId}/todos/${todo.id}`,
-                todo.creator?.name || ''
+                todo.creator?.name || '',
+                false // initial Mark Done checkbox unchecked
               ]);
             });
           });
         });
       });
-
       page++;
     }
   });
 
   if (rows.length) {
     sheet.getRange(2, 1, rows.length, rows[0].length).setValues(rows);
+    const lastCol = rows[0].length;
+    sheet.getRange(2, lastCol, rows.length).insertCheckboxes();
   }
 
   ss.toast('✅ Team-assigned todos synced!', 'Basecamp Sync');
+}
+
+/**
+ * Installable on-edit handler: when user checks 'Mark Done', mark the to-do completed via completion endpoint.
+ */
+function handleEdit(e) {
+  const sheet = e.range.getSheet();
+  if (sheet.getName() !== '🧑‍💼 Team Assigned Tasks') return;
+
+  const markDoneCol = sheet.getLastColumn();
+  if (e.range.getColumn() !== markDoneCol || e.value !== 'TRUE') return;
+
+  const row = e.range.getRow();
+  const itemUrl = sheet.getRange(row, 11).getValue();
+  const [, bucketId, todoId] = itemUrl.match(/buckets\/(\d+)\/todos\/(\d+)/) || [];
+  if (!bucketId || !todoId) return;
+
+  const token = PropertiesService.getScriptProperties().getProperty('ACCESS_TOKEN');
+  const completionUrl = `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/buckets/${bucketId}/todos/${todoId}/completion.json`;
+  try {
+    const res = UrlFetchApp.fetch(completionUrl, {
+      method: 'post',
+      headers: { Authorization: 'Bearer ' + token },
+      muteHttpExceptions: true
+    });
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (res.getResponseCode() === 204) {
+      sheet.getRange(row, 6).setValue('✅');
+      ss.toast('Task closed in Basecamp', 'Success');
+      const title = sheet.getRange(row, 4).getValue();
+      const user = Session.getActiveUser().getEmail();
+      sendTeamsNotification(`✅ *${title}* closed by ${user}.`);
+    } else {
+      throw new Error('HTTP ' + res.getResponseCode() + ': ' + res.getContentText());
+    }
+  } catch (err) {
+    e.range.setValue(false);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    ss.toast('Failed to close task: ' + err.message, 'Error');
+  }
 }
 
 /**
