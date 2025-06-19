@@ -1,24 +1,24 @@
 /**
- * Sync Basecamp todos assigned to specific teams into a single sheet, including cleaned notes,
- * support marking tasks done from the sheet, and send Teams notifications.
+ * Code.gs – Full script for Basecamp ⇄ Sheets ⇄ Teams integration
  */
+
 const BASECAMP_ACCOUNT_ID = '5796684';
-
-// Teams webhook URL stored in Script Properties as TEAMS_WEBHOOK_URL
+// Teams webhook URL (set in Script Properties under key TEAMS_WEBHOOK_URL)
 const TEAMS_WEBHOOK_URL = PropertiesService.getScriptProperties().getProperty('TEAMS_WEBHOOK_URL');
+// Basecamp access token (set in Script Properties under key ACCESS_TOKEN)
+const ACCESS_TOKEN = PropertiesService.getScriptProperties().getProperty('ACCESS_TOKEN');
+// Teams to include in sync
+const FILTER_TEAMS = ['Performance Team', 'Digital Ads Dept.', 'Creative'];
 
-// Specify teams to include
-const FILTER_TEAMS = [
-  'Performance Team',
-  'Digital Ads Dept.',
-  'Creative'
-];
 
 /**
- * Send a plain-text notification to the Teams channel via webhook.
+ * Send a simple text notification into Teams via your incoming webhook.
  */
 function sendTeamsNotification(message) {
-  if (!TEAMS_WEBHOOK_URL) return;
+  if (!TEAMS_WEBHOOK_URL) {
+    Logger.log('TEAMS_WEBHOOK_URL not set; skipping Teams notification.');
+    return;
+  }
   try {
     UrlFetchApp.fetch(TEAMS_WEBHOOK_URL, {
       method: 'post',
@@ -26,179 +26,200 @@ function sendTeamsNotification(message) {
       payload: JSON.stringify({ text: message })
     });
   } catch (e) {
-    Logger.log(`Failed to send Teams notification: ${e}`);
+    Logger.log('Failed to send Teams notification: ' + e);
   }
 }
 
 /**
- * Strip HTML tags and remove images from a string.
+ * Strip all HTML tags (and any <img> tags) from a string, leaving plain text.
  */
 function stripHtml(html) {
   if (!html) return '';
   const noImages = html.replace(/<img[^>]*>/gi, '');
-  return noImages.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  return noImages.replace(/<[^>]+>/g, ' ')
+                 .replace(/\s+/g, ' ')
+                 .trim();
 }
 
 /**
- * Main entry: fetch and write todos for FILTER_TEAMS.
+ * Main sync function – fetches Basecamp todos for FILTER_TEAMS and writes to sheet.
+ * Only clears & rewrites when there are rows to write.
  */
 function syncTeamAssignedTasks() {
-  const token = PropertiesService.getScriptProperties().getProperty('ACCESS_TOKEN');
-  if (!token) throw new Error('ACCESS_TOKEN not found in Script Properties');
-
+  if (!ACCESS_TOKEN) throw new Error('ACCESS_TOKEN not found in Script Properties');
   const headers = {
-    Authorization: 'Bearer ' + token,
+    Authorization: 'Bearer ' + ACCESS_TOKEN,
     Accept: 'application/json',
     'User-Agent': 'Nexus Tickets Tracker (prasanth@ready2ridemobile.com)'
   };
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = getOrCreateSheet(ss, '🧑‍💼 Team Assigned Tasks');
-  resetSheet(sheet, [
+  const headerRow = [
     'Project', 'Todoset', 'Todolist', 'Todo Item', 'Notes', 'Completed',
-    'Assigned To', 'Created At', 'Due Date', 'Status', 'Item URL', 'Created By', 'Mark Done'
-  ]);
+    'Assigned To', 'Created At', 'Due Date', 'Status', 'Item URL',
+    'Created By', 'Mark Done'
+  ];
 
   const statuses = [
-    { label: 'active', url: `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/projects.json` },
+    { label: 'active',   url: `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/projects.json` },
     { label: 'archived', url: `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/projects.json?status=archived` },
-    { label: 'trashed', url: `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/projects.json?status=trashed` }
+    { label: 'trashed',  url: `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/projects.json?status=trashed` }
   ];
 
   const rows = [];
-
   statuses.forEach(status => {
     let page = 1;
     while (true) {
-      const pagedUrl = status.url.includes('?')
-        ? `${status.url}&page=${page}`
+      const url = status.url.includes('?') 
+        ? `${status.url}&page=${page}` 
         : `${status.url}?page=${page}`;
-      const projects = fetchJSON(pagedUrl, headers);
+      const projects = fetchJSON(url, headers);
       if (!projects || !projects.length) break;
 
       projects.forEach(project => {
         const projectName = project.name;
         const bucketId = project.id;
-        const todosets = (project.dock || [])
-          .filter(tool => tool.name === 'todoset' && tool.enabled && tool.url);
-
-        todosets.forEach(tool => {
-          const todosetData = fetchJSON(tool.url, headers);
-          if (!todosetData || !todosetData.todolists_url) return;
-
-          const lists = fetchJSON(todosetData.todolists_url, headers);
-          if (!lists || !lists.length) return;
-
-          lists.forEach(list => {
-            const todosUrl = `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/buckets/${bucketId}/todolists/${list.id}/todos.json`;
-            Utilities.sleep(200);
-            const todos = fetchJSON(todosUrl, headers);
-            if (!todos || !todos.length) return;
-
-            todos.forEach(todo => {
-              const names = (todo.assignees || []).map(p => p.name);
-              if (!names.some(n => FILTER_TEAMS.includes(n))) return;
-
-              rows.push([
-                projectName,
-                todosetData.name || '(Unnamed Todoset)',
-                list.title,
-                todo.content || '',
-                stripHtml(todo.description),
-                todo.completed ? '✅' : '❌',
-                names.join(', '),
-                todo.created_at ? new Date(todo.created_at).toLocaleString() : '',
-                todo.due_on || '',
-                status.label,
-                `https://3.basecamp.com/${BASECAMP_ACCOUNT_ID}/buckets/${bucketId}/todos/${todo.id}`,
-                todo.creator?.name || '',
-                false // initial Mark Done checkbox unchecked
-              ]);
-            });
+        (project.dock || [])
+          .filter(tool => tool.name === 'todoset' && tool.enabled && tool.url)
+          .forEach(tool => {
+            const todoset = fetchJSON(tool.url, headers);
+            if (!todoset || !todoset.todolists_url) return;
+            fetchJSON(todoset.todolists_url, headers)
+              .forEach(list => {
+                Utilities.sleep(200);
+                const todosUrl = 
+                  `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}` +
+                  `/buckets/${bucketId}/todolists/${list.id}/todos.json`;
+                const todos = fetchJSON(todosUrl, headers) || [];
+                todos.forEach(todo => {
+                  const assigneeNames = (todo.assignees || []).map(a => a.name);
+                  if (!assigneeNames.some(n => FILTER_TEAMS.includes(n))) return;
+                  rows.push([
+                    projectName,
+                    todoset.name || '(Unnamed Todoset)',
+                    list.title,
+                    todo.content || '',
+                    stripHtml(todo.description),
+                    todo.completed ? '✅' : '❌',
+                    assigneeNames.join(', '),
+                    todo.created_at ? new Date(todo.created_at).toLocaleString() : '',
+                    todo.due_on || '',
+                    status.label,
+                    `https://3.basecamp.com/${BASECAMP_ACCOUNT_ID}` +
+                      `/buckets/${bucketId}/todos/${todo.id}`,
+                    todo.creator?.name || '',
+                    todo.completed
+                  ]);
+                });
+              });
           });
-        });
       });
+
       page++;
     }
   });
 
   if (rows.length) {
+    resetSheet(sheet, headerRow);
     sheet.getRange(2, 1, rows.length, rows[0].length).setValues(rows);
     const lastCol = rows[0].length;
     sheet.getRange(2, lastCol, rows.length).insertCheckboxes();
+    ss.toast('✅ Team-assigned todos synced!', 'Basecamp Sync');
+  } else {
+    Logger.log('No matching todos found; sheet unchanged.');
   }
-
-  ss.toast('✅ Team-assigned todos synced!', 'Basecamp Sync');
 }
 
 /**
- * Installable on-edit handler: when user checks 'Mark Done', mark the to-do completed via completion endpoint.
+ * Installable on-edit trigger: toggles completion state in Basecamp and sends Teams notifications.
  */
 function handleEdit(e) {
   const sheet = e.range.getSheet();
   if (sheet.getName() !== '🧑‍💼 Team Assigned Tasks') return;
 
   const markDoneCol = sheet.getLastColumn();
-  if (e.range.getColumn() !== markDoneCol || e.value !== 'TRUE') return;
+  if (e.range.getColumn() !== markDoneCol) return;
 
+  const checked = e.value === 'TRUE';
   const row = e.range.getRow();
   const itemUrl = sheet.getRange(row, 11).getValue();
-  const [, bucketId, todoId] = itemUrl.match(/buckets\/(\d+)\/todos\/(\d+)/) || [];
+  const match = itemUrl.match(/buckets\/(\d+)\/todos\/(\d+)/) || [];
+  const bucketId = match[1], todoId = match[2];
   if (!bucketId || !todoId) return;
 
-  const token = PropertiesService.getScriptProperties().getProperty('ACCESS_TOKEN');
-  const completionUrl = `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/buckets/${bucketId}/todos/${todoId}/completion.json`;
+  const method = checked ? 'post' : 'delete';
+  const url = 
+    `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}` +
+    `/buckets/${bucketId}/todos/${todoId}/completion.json`;
+
   try {
-    const res = UrlFetchApp.fetch(completionUrl, {
-      method: 'post',
-      headers: { Authorization: 'Bearer ' + token },
+    const res = UrlFetchApp.fetch(url, {
+      method: method,
+      headers: { Authorization: 'Bearer ' + ACCESS_TOKEN },
       muteHttpExceptions: true
     });
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     if (res.getResponseCode() === 204) {
-      sheet.getRange(row, 6).setValue('✅');
-      ss.toast('Task closed in Basecamp', 'Success');
+      // Update sheet UI
+      sheet.getRange(row, 6).setValue(checked ? '✅' : '❌');
+      ss.toast(
+        checked ? 'Task closed in Basecamp' : 'Task reopened in Basecamp',
+        'Success'
+      );
+      // Notify in Teams
       const title = sheet.getRange(row, 4).getValue();
-      const user = Session.getActiveUser().getEmail();
-      sendTeamsNotification(`✅ *${title}* closed by ${user}.`);
+      const user  = Session.getActiveUser().getEmail() || 'someone';
+      const msg = checked
+        ? `✅ *${title}* closed by ${user}.`
+        : `🔄 *${title}* reopened by ${user}.`;
+      sendTeamsNotification(msg);
     } else {
       throw new Error('HTTP ' + res.getResponseCode() + ': ' + res.getContentText());
     }
   } catch (err) {
-    e.range.setValue(false);
+    // Roll back the checkbox
+    e.range.setValue(!checked);
     const ss = SpreadsheetApp.getActiveSpreadsheet();
-    ss.toast('Failed to close task: ' + err.message, 'Error');
+    ss.toast(
+      'Failed to ' + (checked ? 'close' : 'reopen') + ' task: ' + err.message,
+      'Error'
+    );
   }
 }
 
 /**
- * Fetch JSON, return null on failure.
+ * Helper: fetch JSON from URL, return null on non-200.
  */
 function fetchJSON(url, headers) {
   try {
-    const res = UrlFetchApp.fetch(url, { method: 'get', headers, muteHttpExceptions: true });
+    const res = UrlFetchApp.fetch(url, {
+      method: 'get',
+      headers: headers,
+      muteHttpExceptions: true
+    });
     if (res.getResponseCode() !== 200) return null;
     return JSON.parse(res.getContentText());
   } catch (e) {
-    Logger.log(`Error fetching ${url}: ${e}`);
+    Logger.log('Error fetching JSON: ' + e);
     return null;
   }
 }
 
 /**
- * Clear sheet and write header row.
+ * Get (or insert) a sheet by name.
+ */
+function getOrCreateSheet(ss, name) {
+  let s = ss.getSheetByName(name);
+  if (!s) s = ss.insertSheet(name);
+  return s;
+}
+
+/**
+ * Clear contents, write header row, and freeze it.
  */
 function resetSheet(sheet, headers) {
   sheet.clearContents();
   sheet.appendRow(headers);
   sheet.setFrozenRows(1);
-}
-
-/**
- * Get or create a sheet by name.
- */
-function getOrCreateSheet(ss, name) {
-  let sh = ss.getSheetByName(name);
-  if (!sh) sh = ss.insertSheet(name);
-  return sh;
 }
