@@ -1,14 +1,137 @@
-API KEY:  AIzaSyAh0scf5S6KpfF9zzqVA03E-ifYa9cctDk
+const API_KEYS = [
+  "AIzaSyAh0scf5S6KpfF9zzqVA03E-ifYa9cctDk",
+  "AIzaSyCGZ1sRr5Aa_oQ46SQyvXD2sR_3OLcBB1U",
+  "AIzaSyAonqQGk-wEUj39PjmH6Lt0V1dXp_Xv9hU",
+  "AIzaSyDwXQqxEqFssimPYmQ7PKyWEn0-sBxYmIY",
+  "AIzaSyB2otT3aABu-Vw6AqWSta81JKR6wo_eByw",
+  "AIzaSyAKRelQqtK62Z1iF-wcxxVGOV0BOeL311Y"
+];
 
-Search Engine ID: a6687409d1dae41e5
+const CSE_ID = "a6687409d1dae41e5";
 
+function trackAllDealers() {
+  const masterSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Dealers Websites");
+  const dealers = masterSheet.getDataRange().getValues().slice(1);
+  const logSheet = getOrCreateLogSheet();
+  let processed = 0;
 
-API Key 1 - AIzaSyAh0scf5S6KpfF9zzqVA03E-ifYa9cctDk
+  dealers.forEach((row, index) => {
+    const dealerName = row[0]?.toString().trim();
+    const rawDomain = row[1]?.toString().trim();
+    const rawUrl = row[2]?.toString().trim();
 
-API Key 2 - AIzaSyCGZ1sRr5Aa_oQ46SQyvXD2sR_3OLcBB1U
+    Logger.log(`🔍 Row ${index + 2}: Name='${dealerName}', Domain='${rawDomain}', URL='${rawUrl}'`);
 
-API Key 3 - AIzaSyAonqQGk-wEUj39PjmH6Lt0V1dXp_Xv9hU
+    if (!dealerName || !rawDomain || !rawUrl || !rawUrl.startsWith("http")) {
+      Logger.log(`⚠️ Skipped: Missing or invalid data for row ${index + 2}`);
+      return;
+    }
 
-API Key 4 - AIzaSyDwXQqxEqFssimPYmQ7PKyWEn0-sBxYmIY
+    const dealerDomain = extractDomain(rawDomain);
 
-API Key 5 - AIzaSyB2otT3aABu-Vw6AqWSta81JKR6wo_eByw
+    try {
+      Logger.log(`🔄 Processing: ${dealerName}`);
+      const activeSpreadsheet = SpreadsheetApp.openByUrl(rawUrl);
+      const dealerSheet = activeSpreadsheet.getSheetByName(dealerName);
+      if (!dealerSheet) {
+        Logger.log(`❌ Sheet named '${dealerName}' not found in ${rawUrl}`);
+        return;
+      }
+      const keywords = dealerSheet.getRange("A2:A").getValues().flat().filter(k => k);
+
+      keywords.forEach((kw, i) => {
+        const result = getRank(kw, dealerDomain);
+        dealerSheet.getRange(i + 2, 2).setValue(result.rank);
+        dealerSheet.getRange(i + 2, 3).setValue(result.timestamp);
+        dealerSheet.getRange(i + 2, 4).setValue(result.apiKeyUsed);
+        logSheet.appendRow([new Date().toLocaleString(), dealerName, kw, result.rank, result.apiKeyUsed]);
+        Logger.log(`✅ ${dealerName} | ${kw} => Rank ${result.rank} (Key: ${result.apiKeyUsed})`);
+        Utilities.sleep(1000);
+      });
+
+      processed++;
+    } catch (e) {
+      Logger.log(`❌ Error for ${dealerName}: ${e}`);
+    }
+  });
+
+  const savedMinutes = processed * 17;
+  const msg = processed > 0
+    ? `🎉 Successful Engine Run! Tracked ${processed} dealers. This saved you approx ${savedMinutes} minutes of manual effort 💪`
+    : `⚠️ No valid dealers processed. Check sheet data.`;
+
+  SpreadsheetApp.getUi().alert(msg);
+}
+
+function getRank(keyword, targetDomain) {
+  const api = "https://www.googleapis.com/customsearch/v1";
+
+  for (let k = 0; k < API_KEYS.length; k++) {
+    const currentKey = API_KEYS[k];
+    const params = {
+      key: currentKey,
+      cx: CSE_ID,
+      q: keyword,
+      gl: "us",
+      hl: "en",
+      cr: "countryUS"
+    };
+
+    const query = `${api}?${Object.entries(params).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&")}`;
+
+    try {
+      const response = UrlFetchApp.fetch(query);
+      const json = JSON.parse(response.getContentText());
+      const items = json.items || [];
+
+      for (let i = 0; i < items.length; i++) {
+        const link = items[i].link || "";
+        if (extractDomain(link).includes(targetDomain)) {
+          return {
+            rank: i + 1,
+            timestamp: new Date().toLocaleString(),
+            apiKeyUsed: currentKey
+          };
+        }
+      }
+    } catch (e) {
+      if (e.toString().includes("429")) {
+        Logger.log(`🚫 Quota hit for key ${currentKey}. Trying next.`);
+        continue;
+      } else if (e.toString().includes("403") || e.toString().includes("400")) {
+        Logger.log(`🚫 API error for key ${currentKey}: ${e}`);
+        continue;
+      } else {
+        throw e;
+      }
+    }
+  }
+
+  Logger.log("🔥 All API keys exhausted. No more requests can be made.");
+
+  return {
+    rank: "API Limit exhausted",
+    timestamp: new Date().toLocaleString(),
+    apiKeyUsed: "None"
+  };
+}
+
+function extractDomain(url) {
+  try {
+    let host = new URL(url).hostname;
+    return host.replace("www.", "").toLowerCase();
+  } catch (_) {
+    return url.toLowerCase().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0];
+  }
+}
+
+function getOrCreateLogSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const name = "API Usage Log";
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+    sheet.appendRow(["Timestamp", "Dealer", "Keyword", "Rank", "API Key"]);
+  }
+  return sheet;
+}
