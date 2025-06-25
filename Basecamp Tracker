@@ -1,22 +1,27 @@
 /**
  * BASECAMP ⇄ SHEETS ⇄ TEAMS – Full Integration
+ * Automatically adds a “Team Response” column and logs each “I’m On It” RSVP there.
  */
 
 const BASECAMP_ACCOUNT_ID = '5796684';
 const TEAMS_WEBHOOK_URL   = PropertiesService.getScriptProperties().getProperty('TEAMS_WEBHOOK_URL');
+const WEBAPP_URL          = PropertiesService.getScriptProperties().getProperty('TEAMS_WEBHOOK_SECRET');
 const ACCESS_TOKEN        = PropertiesService.getScriptProperties().getProperty('ACCESS_TOKEN');
 const FILTER_TEAMS        = ['Performance Team','Digital Ads Dept.','Creative'];
 
-/** ===== Generic Helpers ===== */
+/** ===== 0. Post cards to Teams ===== */
 function sendCardToTeams(card) {
   if (!TEAMS_WEBHOOK_URL) return;
-  UrlFetchApp.fetch(TEAMS_WEBHOOK_URL, {
+  const res = UrlFetchApp.fetch(TEAMS_WEBHOOK_URL, {
     method: 'post',
     contentType: 'application/json',
-    payload: JSON.stringify(card)
+    payload: JSON.stringify(card),
+    muteHttpExceptions: true
   });
+  console.log('Teams responded:', res.getResponseCode());
 }
 
+/** ===== Helpers ===== */
 function stripHtml(html) {
   return html
     ? html.replace(/<img[^>]*>/gi,'')
@@ -26,21 +31,16 @@ function stripHtml(html) {
     : '';
 }
 
-/** 3-hour cache wrapper around UrlFetchApp.fetch + JSON.parse */
 function cachedFetchJSON(url, params = {}, context = '') {
-  const cacheKey = Utilities.base64EncodeWebSafe(JSON.stringify([url, params]));
-  const cache    = CacheService.getScriptCache();
-  const cached   = cache.get(cacheKey);
-  if (cached) {
-    console.log(`CACHE HIT [${context}]`);
-    return JSON.parse(cached);
-  }
-  console.log(`CACHE MISS [${context}] → fetching ${url}`);
-  const res = UrlFetchApp.fetch(url, Object.assign({ muteHttpExceptions:true }, params));
-  if (res.getResponseCode() !== 200) return null;
-  const payload = res.getContentText();
-  cache.put(cacheKey, payload, 3 * 60 * 60);  // 3h TTL
-  return JSON.parse(payload);
+  const key = Utilities.base64EncodeWebSafe(`${context}|${url}`);
+  const cache = CacheService.getScriptCache();
+  const hit = cache.get(key);
+  if (hit) return JSON.parse(hit);
+  const res = UrlFetchApp.fetch(url, Object.assign({muteHttpExceptions:true}, params));
+  if (res.getResponseCode()!==200) return null;
+  const body = res.getContentText();
+  try { cache.put(key, body, 3*60*60); } catch(e){}
+  return JSON.parse(body);
 }
 
 function getOrCreateSheet(ss, name) {
@@ -55,53 +55,39 @@ function resetSheet(sheet, headers) {
   sheet.setFrozenRows(1);
 }
 
-/** ===== Config reader for dealer→manager mapping ===== */
-function getDealerManagerMap() {
-  const ss  = SpreadsheetApp.getActiveSpreadsheet();
-  const cfg = ss.getSheetByName('Config');
-  if (!cfg) throw new Error('Config sheet not found');
-  const data = cfg.getRange(2,1,cfg.getLastRow()-1,2).getValues();
-  return data
-    .filter(r => r[0] && r[1])
-    .map(r => ({ dealerPattern: r[0].toString().trim(), manager: r[1].toString().trim() }));
-}
-
-/** ===== 1. Sync & Trim ===== */
+/** ===== 1. Sync Team-Assigned Tasks ===== */
 function syncTeamAssignedTasks() {
   if (!ACCESS_TOKEN) throw new Error('ACCESS_TOKEN missing');
-  const headers = { Authorization:'Bearer '+ACCESS_TOKEN,'Accept':'application/json' };
-  const ss    = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = getOrCreateSheet(ss,'🧑‍💼 Team Assigned Tasks');
+  const headers = { Authorization: 'Bearer ' + ACCESS_TOKEN, Accept: 'application/json' };
+  const ss      = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet   = getOrCreateSheet(ss, '🧑‍💼 Team Assigned Tasks');
   const headerRow = [
     'Project','Todoset','Todolist','Todo Item','Notes','Completed',
     'Assigned To','Created At','Due Date','Status','Item URL','Created By',
-    'Mark Done','Updated By Team'
+    'Mark Done'
   ];
-
   const statuses = [
-    { label:'active',   url:`https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/projects.json` },
-    { label:'archived', url:`https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/projects.json?status=archived` },
-    { label:'trashed',  url:`https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/projects.json?status=trashed` }
+    {label:'active',   url:`https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/projects.json`},
+    {label:'archived', url:`https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/projects.json?status=archived`},
+    {label:'trashed',  url:`https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/projects.json?status=trashed`}
   ];
   const rows = [];
 
   statuses.forEach(st => {
     let page = 1;
     while (true) {
-      const url = st.url.includes('?') ? `${st.url}&page=${page}` : `${st.url}?page=${page}`;
-      const projects = cachedFetchJSON(url, { method:'get', headers }, 'projects');
-      if (!projects?.length) break;
-      projects.forEach(proj => {
+      const url   = st.url + (st.url.includes('?') ? `&page=${page}` : `?page=${page}`);
+      const projs = cachedFetchJSON(url, {method:'get', headers}, 'projects');
+      if (!projs?.length) break;
+      projs.forEach(proj => {
         const pname = proj.name, bid = proj.id;
         (proj.dock||[]).filter(t=>t.name==='todoset'&&t.enabled).forEach(tool=>{
-          const td = cachedFetchJSON(tool.url, { headers }, 'todoset');
+          const td = cachedFetchJSON(tool.url, {headers}, 'todoset');
           if (!td?.todolists_url) return;
-          cachedFetchJSON(td.todolists_url, { headers }, 'todolists').forEach(list=>{
+          cachedFetchJSON(td.todolists_url, {headers}, 'todolists').forEach(list=>{
             Utilities.sleep(200);
-            const todosUrl =
-              `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}` +
-              `/buckets/${bid}/todolists/${list.id}/todos.json`;
-            (cachedFetchJSON(todosUrl, { headers }, 'todos')||[]).forEach(todo=>{
+            const todosUrl = `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/buckets/${bid}/todolists/${list.id}/todos.json`;
+            (cachedFetchJSON(todosUrl, {headers}, 'todos')||[]).forEach(todo=>{
               const names = (todo.assignees||[]).map(a=>a.name);
               if (!names.some(n=>FILTER_TEAMS.includes(n))) return;
               rows.push([
@@ -112,13 +98,12 @@ function syncTeamAssignedTasks() {
                 stripHtml(todo.description),
                 todo.completed?'✅':'❌',
                 names.join(', '),
-                todo.created_at?new Date(todo.created_at).toLocaleString(): '',
+                todo.created_at?new Date(todo.created_at).toLocaleString():'',
                 todo.due_on||'',
                 st.label,
                 `https://3.basecamp.com/${BASECAMP_ACCOUNT_ID}/buckets/${bid}/todos/${todo.id}`,
                 todo.creator?.name||'',
-                todo.completed,  // checkbox
-                ''                // Updated By Team
+                false // Mark Done
               ]);
             });
           });
@@ -128,61 +113,50 @@ function syncTeamAssignedTasks() {
     }
   });
 
+  // write + trim
   resetSheet(sheet, headerRow);
   if (rows.length) {
     sheet.getRange(2,1,rows.length,rows[0].length).setValues(rows);
-    sheet.getRange(2, rows[0].length, rows.length).insertCheckboxes();
+    sheet.getRange(2, 13, rows.length).insertCheckboxes();
   }
-  // remove any extra rows
-  const lastDataRow = rows.length + 1;
-  const totalRows   = sheet.getMaxRows();
-  if (totalRows > lastDataRow) {
-    sheet.deleteRows(lastDataRow+1, totalRows - lastDataRow);
-  }
-  ss.toast('✅ Synced assigned todos (trimmed)', 'Basecamp Sync');
+  const last = rows.length + 1, total = sheet.getMaxRows();
+  if (total > last) sheet.deleteRows(last+1, total-last);
+
+  ss.toast('✅ Synced assigned todos','Basecamp Sync');
 }
 
-/** ===== 2. Handle checkbox edits ===== */
+/** ===== 2. Handle “Mark Done” edits ===== */
 function handleEdit(e) {
   const sh = e.range.getSheet();
   if (sh.getName()!=='🧑‍💼 Team Assigned Tasks') return;
-  const col = sh.getLastColumn() - 1;   // “Mark Done” is second-last column
-  if (e.range.getColumn() !== col) return;
+  const markDoneCol = 13;
+  if (e.range.getColumn() !== markDoneCol) return;
 
-  const checked = e.value==='TRUE', row = e.range.getRow();
+  const checked = e.value === 'TRUE', row = e.range.getRow();
   const url     = sh.getRange(row,11).getValue();
   const bid     = url.match(/buckets\/(\d+)/)[1];
   const todoId  = url.match(/todos\/(\d+)/)[1];
-  const method  = checked?'post':'delete';
-  const apiUrl  = `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}` +
-                  `/buckets/${bid}/todos/${todoId}/completion.json`;
+  const method  = checked ? 'post' : 'delete';
+  const apiUrl  = `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/buckets/${bid}/todos/${todoId}/completion.json`;
 
   try {
     const res = UrlFetchApp.fetch(apiUrl, {
-      method, headers:{ Authorization:'Bearer '+ACCESS_TOKEN }, muteHttpExceptions:true
+      method,
+      headers: {Authorization:'Bearer '+ACCESS_TOKEN},
+      muteHttpExceptions:true
     });
     if (res.getResponseCode()===204) {
-      sh.getRange(row,5).setValue(checked?'✅':'❌');
-      SpreadsheetApp.getActiveSpreadsheet().toast(
-        checked?'Task closed in Basecamp':'Task reopened in Basecamp',
-        'Success'
-      );
-      // Teams notice
+      sh.getRange(row,6).setValue(checked?'✅':'❌');
       const title = sh.getRange(row,4).getValue();
       const user  = Session.getActiveUser().getEmail()||'someone';
       sendCardToTeams({
         "@type":"MessageCard","@context":"http://schema.org/extensions",
-        "summary":"Task Update",
-        "themeColor": checked?"00FF00":"FFA500",
-        "title": checked?`✅ ${title} closed`:`🔄 ${title} reopened`,
-        "text": `*${title}* was ${checked?'closed':'reopened'} by **${user}**.`
+        summary:"Task Update",
+        themeColor: checked?"00FF00":"FFA500",
+        title: checked?`✅ ${title} closed`:`🔄 ${title} reopened`,
+        text: `*${title}* was ${checked?'closed':'reopened'} by **${user}**.`
       });
-      // Bust cache for this todo.json
-      const cache = CacheService.getScriptCache();
-      const key   = Utilities.base64EncodeWebSafe(JSON.stringify([
-        `${url}.json`, { method:'get', headers:{ Authorization:'Bearer '+ACCESS_TOKEN } }
-      ]));
-      cache.remove(key);
+      CacheService.getScriptCache().remove(Utilities.base64EncodeWebSafe(`todos|${url}`));
     } else {
       throw new Error('HTTP '+res.getResponseCode());
     }
@@ -194,86 +168,77 @@ function handleEdit(e) {
 
 /** ===== 3. Morning Digest w/ “I’m On It” ===== */
 function sendMorningDigest() {
-  const webAppUrl = 'https://script.google.com/a/macros/ready2ridemobile.com/s/AKfycbwPYBWu-bHSJcGJrSdVHLSPzoI5eZBUwy2rHF698dhSGk_erjMuZKyVL8jwgHntCYnGRw/exec';
   const ss    = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName('🧑‍💼 Team Assigned Tasks');
   if (!sheet) throw new Error('Tasks sheet not found');
 
   const data   = sheet.getDataRange().getValues();
   const header = data.shift();
-  const i      = name => header.indexOf(name);
+  const i      = name=>header.indexOf(name);
   const cI     = i('Created At'), dI = i('Due Date'),
         pI     = i('Project'),    tI = i('Todo Item'),
         uI     = i('Item URL');
   const tz    = ss.getSpreadsheetTimeZone();
-  const now   = new Date();
-  const today = Utilities.formatDate(now, tz, 'yyyy-MM-dd');
-  const yest  = Utilities.formatDate(new Date(now - 864e5), tz, 'yyyy-MM-dd');
+  const today = Utilities.formatDate(new Date(),tz,'yyyy-MM-dd');
+  const yest  = Utilities.formatDate(new Date(Date.now()-864e5),tz,'yyyy-MM-dd');
   const map   = getDealerManagerMap();
   const groups = {};
 
-  data.forEach(r => {
+  data.forEach(r=>{
     const created = r[cI] instanceof Date
-      ? Utilities.formatDate(r[cI], tz, 'yyyy-MM-dd') : '';
-    const due = r[dI] instanceof Date
-      ? Utilities.formatDate(r[dI], tz, 'yyyy-MM-dd')
-      : r[dI].toString().trim();
-
+                  ? Utilities.formatDate(r[cI],tz,'yyyy-MM-dd') : '';
+    const due     = r[dI] instanceof Date
+                  ? Utilities.formatDate(r[dI],tz,'yyyy-MM-dd') : r[dI];
     let mgr = 'Team';
-    map.forEach(m => { if (r[pI].includes(m.dealerPattern)) mgr = m.manager; });
-
-    if ([today, yest].includes(created) || due === today) {
-      groups[mgr] = groups[mgr] || [];
+    map.forEach(m=>{ if (r[pI].includes(m.dealerPattern)) mgr = m.manager; });
+    if ([today,yest].includes(created) || due===today) {
+      groups[mgr] = groups[mgr]||[];
       groups[mgr].push({
         title:   r[tI],
         url:     r[uI],
         project: r[pI],
-        ticketId: r[uI].split('/').pop()
+        ticketId:r[uI].split('/').pop()
       });
     }
   });
+  if (!Object.keys(groups).length) return;
 
-  const sections = [];
-  Object.entries(groups).forEach(([mgr, tickets]) => {
-    const facts = tickets.map(t=>({
-      name: `• ${t.title}`,
+  const sections = Object.entries(groups).map(([mgr,tickets])=>({
+    activityTitle:`**@${mgr}**`,
+    facts: tickets.map(t=>({
+      name:`• ${t.title}`,
       value:`_${t.project}_ • [View](${t.url})`
-    }));
-    sections.push({ activityTitle:`**@${mgr}**`, facts, markdown:true });
-  });
-
+    })),
+    markdown:true
+  }));
   const inputChoices = Object.values(groups).flat().map(t=>({
     "@type":"TextChoice",
     display:`${t.title} (${t.project})`,
-    value: t.ticketId
+    value:t.ticketId
   }));
 
   const card = {
     "@type":"MessageCard","@context":"http://schema.org/extensions",
     summary:"Morning Digest", themeColor:"0076D7",
     title:`🌞 Morning Digest (${yest} & ${today})`,
-    sections, 
+    sections,
     potentialAction:[
       {
-        "@type":"ActionCard",
-        name:"I’m On It",
+        "@type":"ActionCard", name:"I’m On It",
         inputs:[{
-          "@type":"MultichoiceInput",
-          id:"ticketId",
-          title:"Select the ticket you’re on:",
-          isMultiSelect:false,
-          choices:inputChoices
+          "@type":"MultichoiceInput", id:"ticketId",
+          title:"Select the ticket you’re on:", isMultiSelect:false,
+          choices: inputChoices
         }],
         actions:[{
-          "@type":"HttpPOST",
-          name:"Submit",
-          target:webAppUrl
+          "@type":"HttpPOST", name:"Submit",
+          target: WEBAPP_URL,
+          body:   "ticketId={{ticketId.value}}"
         }]
       },
       {
-        "@type":"OpenUri",
-        name:"Open Tracker Sheet",
-        targets:[{ os:"default", uri:ss.getUrl() }]
+        "@type":"OpenUri", name:"Open Tracker Sheet",
+        targets:[{os:"default",uri:ss.getUrl()}]
       }
     ]
   };
@@ -281,37 +246,28 @@ function sendMorningDigest() {
   sendCardToTeams(card);
 }
 
-/** ===== 4. Chain sync → Morning Digest ===== */
-function syncThenDigest() {
-  syncTeamAssignedTasks();
-  sendMorningDigest();
-}
-
-/** ===== 5. End-of-Day Reminder ===== */
+/** ===== 4. End-of-Day Reminder @ 17:00 ===== */
 function sendEODReminder() {
-  const ss  = SpreadsheetApp.getActiveSpreadsheet();
-  const sh  = ss.getSheetByName('🧑‍💼 Team Assigned Tasks');
+  const ss    = SpreadsheetApp.getActiveSpreadsheet();
+  const sh    = ss.getSheetByName('🧑‍💼 Team Assigned Tasks');
   if (!sh) throw new Error('Tasks sheet not found');
 
-  const data  = sh.getDataRange().getValues();
-  const hdr   = data.shift();
-  const i     = name => hdr.indexOf(name);
-  const dueI  = i('Due Date'), doneI = i('Completed');
-  const titleI= i('Todo Item'), urlI  = i('Item URL');
-  const tz    = ss.getSpreadsheetTimeZone();
-  const today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+  const data   = sh.getDataRange().getValues();
+  const hdr    = data.shift();
+  const i      = name=>hdr.indexOf(name);
+  const dueI   = i('Due Date'), doneI = i('Completed');
+  const titleI = i('Todo Item'), urlI = i('Item URL');
+  const tz     = ss.getSpreadsheetTimeZone();
+  const today  = Utilities.formatDate(new Date(),tz,'yyyy-MM-dd');
 
-  const openDueToday = data.filter(r => {
+  const pending = data.filter(r=>{
     const due = r[dueI] instanceof Date
-      ? Utilities.formatDate(r[dueI], tz, 'yyyy-MM-dd')
-      : r[dueI];
-    return due === today && r[doneI] !== '✅';
+              ? Utilities.formatDate(r[dueI],tz,'yyyy-MM-dd') : r[dueI];
+    return due===today && r[doneI]!=='✅';
   });
+  if (!pending.length) return;
 
-  if (!openDueToday.length) return;
-
-  const bullets = openDueToday.map(r=>`• [${r[titleI]}](${r[urlI]})`).join('\n');
-
+  const bullets = pending.map(r=>`• [${r[titleI]}](${r[urlI]})`).join('\n');
   sendCardToTeams({
     "@type":"MessageCard","@context":"http://schema.org/extensions",
     summary:"EOD Reminder", themeColor:"FFA500",
@@ -320,15 +276,58 @@ function sendEODReminder() {
   });
 }
 
-/** ===== Web App Handlers ===== */
-function doGet(e) {
+/** ===== 5. Sync → Digest ===== */
+function syncThenDigest() {
+  syncTeamAssignedTasks();
+  sendMorningDigest();
+}
+
+/** ===== 6. Web-App Handlers with dynamic “Team Response” column ===== */
+function doGet() {
   return ContentService.createTextOutput('OK')
                        .setMimeType(ContentService.MimeType.TEXT);
 }
 
 function doPost(e) {
+  // merge JSON + form params
+  let payload = {};
+  if (e.postData && e.postData.type==='application/json') {
+    payload = JSON.parse(e.postData.contents);
+  }
+  payload = Object.assign({}, payload, e.parameter);
+  console.log('Payload:', payload);
+
+  if (payload.ticketId) {
+    const ss    = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName('🧑‍💼 Team Assigned Tasks');
+    const data  = sheet.getDataRange().getValues();
+    const header = data.shift();
+
+    // ensure “Team Response” column exists
+    let respCol = header.indexOf('Team Response');
+    if (respCol < 0) {
+      respCol = header.length;
+      sheet.insertColumnAfter(respCol);
+      sheet.getRange(1, respCol+1).setValue('Team Response');
+    }
+
+    // find matching row by ticketId
+    const urlCol = header.indexOf('Item URL');
+    const user   = Session.getActiveUser().getEmail() || 'someone';
+    const stamp  = new Date().toLocaleString();
+    for (let i = 0; i < data.length; i++) {
+      if (`${data[i][urlCol]}`.endsWith('/'+payload.ticketId)) {
+        sheet.getRange(i+2, respCol+1)
+             .setValue(`I’m On It by ${user} @ ${stamp}`);
+        break;
+      }
+    }
+    return ContentService.createTextOutput('OK')
+                         .setMimeType(ContentService.MimeType.TEXT);
+  }
+
+  // fallback: post new Basecamp ticket to Teams
   try {
-    const payload = JSON.parse(e.postData.getDataAsString());
     const title   = payload.content || payload.title;
     const project = payload.bucket?.name;
     const url     = payload.app_url;
@@ -339,9 +338,8 @@ function doPost(e) {
       title:`🆕 New Ticket: ${title}`,
       text:`**Project:** ${project}\n**Created by:** ${creator}`,
       potentialAction:[{
-        "@type":"OpenUri",
-        name:"View in Basecamp",
-        targets:[{ os:"default", uri:url }]
+        "@type":"OpenUri", name:"View in Basecamp",
+        targets:[{os:"default",uri:url}]
       }]
     });
     return ContentService.createTextOutput('OK');
@@ -349,4 +347,15 @@ function doPost(e) {
     console.error(err);
     return ContentService.createTextOutput('Error').setStatusCode(500);
   }
+}
+
+/** ===== Config reader ===== */
+function getDealerManagerMap() {
+  const ss  = SpreadsheetApp.getActiveSpreadsheet();
+  const cfg = ss.getSheetByName('Config');
+  if (!cfg) throw new Error('Config sheet not found');
+  const data = cfg.getRange(2,1,cfg.getLastRow()-1,2).getValues();
+  return data
+    .filter(r=>r[0]&&r[1])
+    .map(r=>({ dealerPattern:r[0].toString().trim(), manager:r[1].toString().trim() }));
 }
