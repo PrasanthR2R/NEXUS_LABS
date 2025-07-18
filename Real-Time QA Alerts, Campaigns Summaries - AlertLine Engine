@@ -1,0 +1,266 @@
+// === CONFIGURATION ===
+const SHEET_ID          = '15x5f84i8vvovzFBD4JYQA-5Y2hcxD4XeMcgNdj8fN4g';
+const SHEET_NAME        = 'Print Campaigns - On Going';
+const SHEET_URL         = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`;
+const TEAMS_WEBHOOK_URL = 'https://clictechnologies.webhook.office.com/webhookb2/d1d4f6f7-5378-4d2d-ba87-aedba03b3585@a4e69a77-1b2a-432a-b01b-19ce339290cc/IncomingWebhook/df2321c58e5040698060aef988751815/67cddb26-ab0c-4458-9ab3-9d33d615642b/V2l5uS0W25X-svMs9EkN9CcCdGtehqgHh-Z4HUoNiFiis1';
+
+// === MAIN FUNCTION ===
+function onEdit(e) {
+  try {
+    const sheet = e.source.getSheetByName(SHEET_NAME);
+    if (!sheet || sheet.getName() !== SHEET_NAME) return;
+
+    const editedRow = e.range.getRow();
+    const data = sheet.getDataRange().getValues();
+    const headers = data[0].map(h => h.toString().trim().toLowerCase());
+
+    // Get column indexes
+    const colQAStatus = headers.indexOf('qa status');
+    const colQAedBy   = headers.indexOf("qa'ed by");
+    const colDev      = headers.indexOf("db devs");
+    const colCampID   = headers.indexOf("campaign_id");
+    const colCampName = headers.indexOf("campaignname");
+    const colDealer   = headers.indexOf("dealer name");
+    const colComment  = headers.indexOf("qa comments");
+    const colLastNoti = headers.indexOf('last notified status');
+
+    if ([colQAStatus, colQAedBy, colDev, colCampID, colCampName, colDealer, colComment, colLastNoti].some(i => i < 0)) {
+      console.error('❌ One or more required columns are missing.');
+      return;
+    }
+
+    const row = data[editedRow - 1];
+    let qaStatus = (row[colQAStatus] || '').toString().trim();
+    const qaBy     = (row[colQAedBy] || 'None').toString().trim();
+    let dev        = (row[colDev] || 'None').toString().trim();
+    const campId   = (row[colCampID] || 'N/A').toString().trim();
+    const campName = (row[colCampName] || 'Unnamed Campaign').toString().trim();
+    const dealer   = (row[colDealer] || 'Unknown Dealer').toString().trim();
+    const comment  = (row[colComment] || 'No QA comment provided').toString().trim();
+    const prevNotified = (row[colLastNoti] || '').toString().trim();
+
+    if (qaStatus === prevNotified) return;
+
+    // === Auto-clear DB Dev if QA Status doesn't require it ===
+    const devNeededStatuses = ['has issues', 'needs discussion'];
+    const needsDev = devNeededStatuses.includes(qaStatus.toLowerCase());
+
+    if (!needsDev && dev.toLowerCase() !== 'none') {
+      sheet.getRange(editedRow, colDev + 1).setValue('None');
+      dev = 'None';
+    }
+
+    // === Build Card ===
+    let shouldNotify = false;
+    let cardColor = '999999';
+    let cardTitle = `Campaign Update – ${campName}`;
+    let cardBody = [
+      { name: '🆔 Campaign ID:', value: campId },
+      { name: '📨 Campaign Name:', value: campName },
+      { name: '🏪 Dealer:', value: dealer },
+      { name: '🎯 QA Status:', value: qaStatus },
+      { name: "🕵️ QA'ed By:", value: qaBy }
+    ];
+
+    if (dev.toLowerCase() !== 'none') {
+      cardBody.push({ name: '👨‍💻 Assigned Dev', value: dev });
+    }
+
+    const qaFilled  = qaBy.toLowerCase() !== 'none' && qaBy !== '';
+    const devFilled = dev.toLowerCase() !== 'none' && dev !== '';
+
+    switch (qaStatus.toLowerCase()) {
+      case 'has issues':
+        if (qaFilled && devFilled && comment !== '') {
+          shouldNotify = true;
+          cardColor = 'FF0000';
+          cardTitle = `🛑 Issue Detected In “${campName}” – Needs DEV Attention!`;
+          cardBody.push({ name: '📝 QA Comment', value: comment });
+        }
+        break;
+
+      case 'needs discussion':
+        if (qaFilled && devFilled) {
+          shouldNotify = true;
+          cardColor = 'D93F0B';
+          cardTitle = `💬 Discussion Needed On “${campName}” – Inputs Awaited`;
+        }
+        break;
+
+      case 'resolved':
+        if (qaFilled && !devFilled) {
+          shouldNotify = true;
+          cardColor = '28A745';
+          cardTitle = `✅ Resolved: “${campName}” Is Good To Go`;
+        }
+        break;
+
+      case 'not an issue':
+        if (qaFilled && !devFilled) {
+          shouldNotify = true;
+          cardColor = '888888';
+          cardTitle = `👌 Cleared: “${campName}” Needs No Further Action`;
+        }
+        break;
+
+      case 'good to approve':
+        if (qaFilled && !devFilled) {
+          shouldNotify = true;
+          cardColor = '0078D7';
+          cardTitle = `📝 All Checks Passed – “${campName}” Ready For Approval`;
+        }
+        break;
+
+      case 'approved':
+        if (qaFilled && !devFilled) {
+          shouldNotify = true;
+          cardColor = '00B14F';
+          cardTitle = `💯 Approved: “${campName}” Is Now Deployment-Ready`;
+        }
+        break;
+
+      case 'waiting for approval':
+        // No notification
+        break;
+    }
+
+    if (shouldNotify) {
+      const card = {
+        "@type": "MessageCard",
+        "@context": "https://schema.org/extensions",
+        "summary": cardTitle,
+        "themeColor": cardColor,
+        "title": cardTitle,
+        "sections": [{ facts: cardBody, markdown: true }],
+        "potentialAction": [{
+          "@type": "OpenUri",
+          "name": "📄 View Sheet",
+          "targets": [{ "os": "default", "uri": SHEET_URL }]
+        }]
+      };
+
+      UrlFetchApp.fetch(TEAMS_WEBHOOK_URL, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify(card)
+      });
+
+      sheet.getRange(editedRow, colLastNoti + 1).setValue(qaStatus);
+
+    } else {
+      // No notification sent – revert QA status to last notified
+      sheet.getRange(editedRow, colQAStatus + 1).setValue(prevNotified);
+    }
+
+  } catch (err) {
+    console.error("🚨 Script Error:", err);
+  }
+}
+
+function sendQASummaryToTeams() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Print Campaigns - On Going");
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0].map(h => h.toString().trim());
+
+  const approved = [];
+  const discuss = [];
+  const waiting = [];
+
+  const normalize = str => str.replace(/[\u2018\u2019]/g, "'").trim().toLowerCase();
+  const getColumnIndex = (colName) =>
+    headers.findIndex(h => normalize(h) === normalize(colName));
+
+  const statusCol = getColumnIndex('QA Status');
+  const nameCol = getColumnIndex('CampaignName');
+  const dealerCol = getColumnIndex('Dealer Name');
+  const qaByCol = getColumnIndex("QA'ed By");
+
+  if (statusCol === -1 || nameCol === -1 || dealerCol === -1 || qaByCol === -1) {
+    Logger.log("❌ One or more required columns not found.");
+    Logger.log("Headers available: " + JSON.stringify(headers));
+    return;
+  }
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const status = row[statusCol] || "";
+    const name = row[nameCol] || "";
+    const dealer = row[dealerCol] || "";
+    const qaBy = row[qaByCol] || "N/A";
+
+    if (!name) continue;
+
+    const formatted = `${name} – ${dealer} (QA’ed by ${qaBy})`;
+    const statusLower = status.toString().trim().toLowerCase();
+
+    if (statusLower === 'approved') {
+      approved.push(formatted);
+    } else if (statusLower === 'needs discussion') {
+      discuss.push(formatted);
+    } else if (statusLower === 'waiting for approval') {
+      waiting.push(formatted);
+    }
+  }
+
+  const today = new Date();
+  const formattedDate = Utilities.formatDate(today, Session.getScriptTimeZone(), "MMMM dd, yyyy");
+
+  const lines = [];
+
+  // Bold intro header
+  lines.push(`<strong>📢 Hey Everyone, Here's The Quick Daily Campaign QA Summary – ${formattedDate}</strong>`);
+  lines.push("<br><br>");
+
+  // Approved Section
+  if (approved.length) {
+    lines.push(`<span>✅</span> <strong>Total Approved Campaigns (${approved.length}):</strong>`);
+    approved.forEach((item, index) => {
+      lines.push(`${index + 1}. ${item}<br>`);
+    });
+    lines.push("<br>");
+  }
+
+  // Discussion Section (FIXED ALIGNMENT)
+  if (discuss.length) {
+    lines.push(`<span>💬</span> <strong>Needs Discussion (${discuss.length}):</strong>`);
+    discuss.forEach((item, index) => {
+      lines.push(`${index + 1}. ${item}<br>`);
+    });
+    lines.push("<br>");
+  }
+
+  // Waiting Section (also left-aligned)
+  if (waiting.length) {
+    lines.push(`<span>⏳</span> <strong>Waiting for Approval (${waiting.length}):</strong>`);
+    waiting.forEach((item, index) => {
+      lines.push(`${index + 1}. ${item}<br>`);
+    });
+    lines.push("<br>");
+  }
+
+  // Footer (blue, bold, full-left-aligned with 2 gaps before it)
+  lines.push("<br><br>");
+  lines.push(`<div style="color:#0078D7; text-align:left;"><em>This is an auto-generated summary. Brought to you by the <strong>NEXUS</strong> Engine.</em></div>`);
+
+  const message = {
+    "@type": "MessageCard",
+    "@context": "http://schema.org/extensions",
+    "themeColor": "0076D7",
+    "summary": "Daily QA Summary",
+    "sections": [
+      {
+        "text": lines.join("\n")
+      }
+    ]
+  };
+
+  const webhookUrl = "https://clictechnologies.webhook.office.com/webhookb2/d1d4f6f7-5378-4d2d-ba87-aedba03b3585@a4e69a77-1b2a-432a-b01b-19ce339290cc/IncomingWebhook/df2321c58e5040698060aef988751815/67cddb26-ab0c-4458-9ab3-9d33d615642b/V2l5uS0W25X-svMs9EkN9CcCdGtehqgHh-Z4HUoNiFiis1";
+
+  const options = {
+    method: "POST",
+    contentType: "application/json",
+    payload: JSON.stringify(message)
+  };
+
+  UrlFetchApp.fetch(webhookUrl, options);
+}
