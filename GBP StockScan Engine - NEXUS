@@ -1,0 +1,124 @@
+function checkInventoryStatusAcrossSheets() {
+  const ENGINE = "GBP StockScan Engine - NEXUS";
+  const start = Date.now();
+  let status = "OK";
+  let errorMessage = "";
+
+  const logSheetId = "18NPm8ZUkskHxTPqRrDrNTwlujlWDInJcHEVuPeJqSUg";
+  const logSheetName = "NEXUS_Engine_Health_Log";
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheets = ss.getSheets();
+  const timestamp = new Date();
+
+  const soldIndicators = [
+    "we're sorry, no results were found for your request",
+    "no results were found for your request",
+    "no results were found",
+    "unit is no longer available",
+    "unit not found",
+    "this page is no longer available",
+    "inventory not found",
+    "inventory item not found",
+    "no longer in our inventory",
+    "this vehicle is not available",
+    "this unit has been sold",
+    "search returned no results",
+    "your search returned no matches",
+    "home › 404 error page",
+    "we have much cooler pages",
+    "sorry, the page you are looking for is no longer available",
+    "unfortunately, we couldn’t find what you’re looking for",
+    'class="overlay_txt sold"',
+    'class="image_overlay visible sold"',
+    '>sold<',
+    '">sold<',
+    'alt="sold"',
+    'data-status="sold"',
+    'sold.png',
+    /<div[^>]*class=["'][^"']*sold[^"']*["'][^>]*>([\s\S]*?)sold([\s\S]*?)<\/div>/i
+  ];
+
+  try {
+    for (const sheet of sheets) {
+      const values = sheet.getDataRange().getValues();
+      if (values.length <= 1) continue; // skip header-only sheets
+
+      for (let i = 1; i < values.length; i++) {
+        const url = values[i][1]; // Column B: Landing Page URL
+        if (!url) continue;
+
+        let modelTitle = "";
+        let pageStatus = "";
+
+        try {
+          const response = UrlFetchApp.fetch(url, {
+            followRedirects: true,
+            muteHttpExceptions: true,
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+            }
+          });
+
+          const code = response.getResponseCode();
+          const html = response.getContentText();
+          const content = html.toLowerCase();
+
+          // Try model title detection
+          const ldMatch = html.match(/<script\s+type="application\/ld\+json">([\s\S]*?)<\/script>/i);
+          if (ldMatch) {
+            try {
+              const data = JSON.parse(ldMatch[1]);
+              if (data.name) modelTitle = data.name.trim();
+            } catch (e) {}
+          }
+
+          if (!modelTitle) {
+            const titleMatch = html.match(/<title>(.*?)<\/title>/i);
+            if (titleMatch) modelTitle = titleMatch[1].trim();
+          }
+
+          if (!modelTitle) {
+            const ogTitleMatch = html.match(/<meta property="og:title" content="(.*?)"/i);
+            if (ogTitleMatch) modelTitle = ogTitleMatch[1].trim();
+          }
+
+          if (!modelTitle) {
+            const h1Match = html.match(/<h1[^>]*>(.*?)<\/h1>/i);
+            if (h1Match) modelTitle = h1Match[1].trim();
+          }
+
+          // SOLD status check
+          const matchesSold = soldIndicators.some(keyword => {
+            if (typeof keyword === "string") return content.includes(keyword);
+            if (keyword instanceof RegExp) return keyword.test(html);
+            return false;
+          });
+
+          pageStatus = (code === 404 || matchesSold) ? "❌ Sold / Unavailable" : "✅ In-Stock";
+
+        } catch (err) {
+          modelTitle = "⚠️ Error";
+          pageStatus = "⚠️ Error";
+        }
+
+        sheet.getRange(i + 1, 3).setValue(modelTitle || "–");  // Model Name (C)
+        sheet.getRange(i + 1, 4).setValue(pageStatus);         // Status (D)
+        sheet.getRange(i + 1, 5).setValue(timestamp);          // Last Checked (E)
+      }
+    }
+
+  } catch (err) {
+    status = "ERROR";
+    errorMessage = err.message;
+  } finally {
+    const runtime = ((Date.now() - start) / 1000).toFixed(2) + "s";
+    try {
+      const logSheet = SpreadsheetApp.openById(logSheetId).getSheetByName(logSheetName);
+      if (logSheet) {
+        logSheet.appendRow([ENGINE, new Date(), status, runtime, errorMessage]);
+      }
+    } catch (logErr) {
+      console.warn("⚠️ Failed to write to engine log:", logErr.message);
+    }
+  }
+}
