@@ -1,0 +1,115 @@
+function runGVLGarageLinkEngine_SIMPLY_RIDE() {
+  const ENGINE_NAME = "GVL GarageLink Engine – SIMPLY RIDE – NEXUS";
+  const start = new Date();
+
+  const ss = SpreadsheetApp.openById("1N2sXZdbfT6vmvm3kOlEstJ9KTf2C7odx1tx9-UCoAGA");
+  const sheet = ss.getSheetByName("Vehicle Listings Data");
+  const logSheet = SpreadsheetApp.openById("18NPm8ZUkskHxTPqRrDrNTwlujlWDInJcHEVuPeJqSUg")
+                               .getSheetByName("NEXUS_Engine_Health_Log");
+
+  const url = "https://dx1.azure-api.net/iod/b057e050-3d67-4696-a090-834b67d2e6f8";
+
+  let status = "Success";
+  let errorMsg = "";
+
+  try {
+    // STEP 1 – Fetch & Parse XML
+    const xml = UrlFetchApp.fetch(url).getContentText();
+    const doc = XmlService.parse(xml);
+    const root = doc.getRootElement();
+    const listings = root.getChild("listings")?.getChildren("listing") || [];
+
+    // STEP 2 – Format Data
+    const headers = [
+      "store_code", "id", "vin", "year", "make", "model", "exterior_color", "mileage",
+      "fuel", "transmission", "condition", "price", "vehicle_msrp", "dealership_name",
+      "dealership_address", "link", "image_link", "additional_image_link"
+    ];
+    const PLACEHOLDER_STORE_CODE = "simply19460";
+    const DEALERSHIP_NAME = "Simply Ride";
+    const DEALERSHIP_ADDRESS = "7550 Washington Ave S, Eden Prairie, MN 55344, US";
+
+    const data = listings.map(listing => {
+      const get = tag => (listing.getChildText(tag) || "").trim();
+      const getNested = (parent, child) => (listing.getChild(parent)?.getChildText(child) || "").trim();
+
+      const id = get("id") || Utilities.getUuid();
+      const vin = get("vin");
+      const year = get("model-year");
+      const make = get("manufacturer");
+      const model = get("model");
+      const color = get("color-primary");
+      const mileage = get("miles");
+      const fuel = get("fuel-type");
+      const transmission = get("transmission");
+      const condition = get("condition");
+      const price = getNested("price", "text") + " USD";
+      const msrp = "";
+      const link = get("listing-url");
+
+      const photos = listing.getChild("listing-photos")?.getChildren("photo") || [];
+      const image_link = photos[0]?.getChildText("url") || "";
+      const additional_images = photos.slice(1).map(p => p.getChildText("url")).join(" ");
+
+      return [
+        PLACEHOLDER_STORE_CODE,
+        id,
+        vin,
+        year,
+        make,
+        model,
+        color,
+        mileage,
+        fuel,
+        transmission,
+        condition,
+        price,
+        msrp,
+        DEALERSHIP_NAME,
+        DEALERSHIP_ADDRESS,
+        link,
+        image_link,
+        additional_images
+      ];
+    });
+
+    // STEP 3 – Write to Sheet
+    sheet.clear();
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    if (data.length > 0) {
+      sheet.getRange(2, 1, data.length, headers.length).setValues(data);
+    } else {
+      sheet.getRange("A2").setValue("⚠️ No listings found.");
+      status = "⚠️ No Listings";
+    }
+
+    // STEP 4 – Export to CSV in Drive
+    const folderName = "GVL_Feeds";
+    const folder = DriveApp.getFoldersByName(folderName).hasNext()
+      ? DriveApp.getFoldersByName(folderName).next()
+      : DriveApp.createFolder(folderName);
+
+    const csv = sheet.getDataRange().getValues()
+      .map(row => row.map(cell => `"${cell}"`).join(","))
+      .join("\n");
+
+    const fileName = `GVL_Feed_SimplyRide_LATEST.csv`;
+    folder.createFile(fileName, csv, MimeType.CSV);
+
+  } catch (e) {
+    status = "❌ Error";
+    errorMsg = e.message;
+    sheet.getRange("A1").setValue("❌ Failed to import: " + errorMsg);
+  }
+
+  // STEP 5 – Log to Engine Health Sheet
+  const end = new Date();
+  const runtimeSec = ((end - start) / 1000).toFixed(1);
+  logSheet.appendRow([
+    ENGINE_NAME,
+    new Date(),
+    status,
+    `${runtimeSec}s`,
+    errorMsg
+  ]);
+}
