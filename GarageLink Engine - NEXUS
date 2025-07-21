@@ -1,0 +1,96 @@
+function importDX1_GoogleFeedFixed() {
+  const startTime = new Date();
+  const sheet = SpreadsheetApp.openById("1N2sXZdbfT6vmvm3kOlEstJ9KTf2C7odx1tx9-UCoAGA").getSheetByName("Automated Data");
+  const logSheet = SpreadsheetApp.openById("18NPm8ZUkskHxTPqRrDrNTwlujlWDInJcHEVuPeJqSUg").getSheetByName("NEXUS_Engine_Health_Log");
+  const url = "https://dx1.azure-api.net/iod/b057e050-3d67-4696-a090-834b67d2e6f8";
+  
+  let status = "Success", errorMsg = "";
+  
+  try {
+    const xml = UrlFetchApp.fetch(url).getContentText();
+    const doc = XmlService.parse(xml);
+    const root = doc.getRootElement();
+    const listings = root.getChild("listings")?.getChildren("listing") || [];
+
+    const headers = [
+      "ID", "VIN", "Price", "Sale price", "Final URL", "Image URL", "additional_image_link", "year", "brand",
+      "model", "color", "mileage", "condition", "Item title", "Item description",
+      "availability", "identifier_exists", "google_product_category", "vehicle_fulfillment", "store_code",
+      "certified_pre-owned", "link_template"
+    ];
+
+    const data = listings.map(listing => {
+      const get = tag => (listing.getChildText(tag) || "").trim();
+      const getNested = (parent, child) => (listing.getChild(parent)?.getChildText(child) || "").trim();
+
+      const vin = get("vin");
+      const id = get("id") || vin || Utilities.getUuid();
+      const price = getNested("price", "text");
+      const url = get("listing-url");
+      const year = get("model-year");
+      const brand = get("manufacturer");
+      const model = get("model");
+      const color = get("color-primary");
+      const mileage = get("miles");
+      const condition = get("condition");
+      const title = `${year} ${brand} ${model}`.trim();
+
+      let desc = get("description-long") || get("description-short") || title;
+      desc = desc.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+
+      const images = listing.getChild("listing-photos")?.getChildren("photo") || [];
+      const imageUrl = images.length > 0 ? images[0].getChildText("url") : "";
+      const additionalImages = images.slice(1).map(p => p.getChildText("url")).join(", ");
+
+      return [
+        id,
+        vin,
+        price,
+        "", // Sale price
+        url,
+        imageUrl,
+        additionalImages,
+        year,
+        brand,
+        model,
+        color,
+        mileage,
+        condition,
+        title,
+        desc,
+        "in stock",
+        "yes",
+        "Vehicles & Parts > Vehicles",
+        "",
+        "SIMPLY_RIDE",
+        "no",
+        ""
+      ];
+    });
+
+    sheet.clear();
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    if (data.length > 0) {
+      sheet.getRange(2, 1, data.length, headers.length).setValues(data);
+      Logger.log("✅ Feed with cleaned fields pushed to sheet.");
+    } else {
+      Logger.log("⚠️ No listings found.");
+      sheet.getRange("A2").setValue("⚠️ No listings found.");
+    }
+  } catch (e) {
+    status = "Error";
+    errorMsg = e.message;
+    Logger.log("❌ ERROR: " + errorMsg);
+    sheet.getRange("A1").setValue("❌ ERROR: " + errorMsg);
+  } finally {
+    const endTime = new Date();
+    const runtimeSec = ((endTime - startTime) / 1000).toFixed(2);
+    logSheet.appendRow([
+      "GarageLink Engine - NEXUS", // Engine Name
+      new Date(),             // Timestamp
+      status,                 // Status
+      runtimeSec,             // Runtime
+      errorMsg                // Error (if any)
+    ]);
+  }
+}
