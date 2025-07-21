@@ -1,0 +1,106 @@
+function checkInventoryStatus() {
+  const ENGINE = "StockScan Engine – NEXUS";
+  const start = Date.now();
+  let status = "OK";
+  let errorMessage = "";
+
+  try {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+    const range = sheet.getDataRange();
+    const values = range.getValues();
+
+    for (let i = 1; i < values.length; i++) {
+      const url = values[i][1]; // Column B = Landing Page URL
+      if (!url) continue;
+
+      try {
+        const response = UrlFetchApp.fetch(url, {
+          followRedirects: true,
+          muteHttpExceptions: true
+        });
+
+        const code = response.getResponseCode();
+        const content = response.getContentText().toLowerCase();
+        let modelTitle = "";
+        let pageStatus = "";
+
+        const titleMatch = content.match(/<title>(.*?)<\/title>/i);
+        if (titleMatch) {
+          modelTitle = titleMatch[1].trim();
+        }
+
+        if (!modelTitle) {
+          const ogTitleMatch = content.match(/<meta property="og:title" content="(.*?)"/i);
+          if (ogTitleMatch) {
+            modelTitle = ogTitleMatch[1].trim();
+          }
+        }
+
+        const soldIndicators = [
+          "we're sorry, no results were found for your request",
+          "no results were found for your request",
+          "no results were found",
+          "unit is no longer available",
+          "unit not found",
+          "this page is no longer available",
+          "inventory not found",
+          "inventory item not found",
+          "no longer in our inventory",
+          "this vehicle is not available",
+          "this unit has been sold",
+          "search returned no results",
+          "your search returned no matches",
+          "home › 404 error page",
+          "we have much cooler pages",
+          "sorry, the page you are looking for is no longer available",
+          "unfortunately, we couldn’t find what you’re looking for",
+          'class="overlay_txt sold"',
+          'class="image_overlay visible sold"',
+          '>sold<',
+          '">sold<',
+          'alt="sold"',
+          'data-status="sold"',
+          'sold.png'
+        ];
+
+        const soldOverlayMatch = /<div[^>]*class=["'][^"']*sold[^"']*["'][^>]*>([\s\S]*?)sold([\s\S]*?)<\/div>/i.test(content);
+        const matchesSold = soldIndicators.some(keyword => content.includes(keyword)) || soldOverlayMatch;
+
+        if (code === 404 || matchesSold) {
+          pageStatus = "❌ Sold / Unavailable";
+        } else {
+          pageStatus = "✅ In-Stock";
+        }
+
+        sheet.getRange(i + 1, 3).setValue(modelTitle || "–");
+        sheet.getRange(i + 1, 4).setValue(pageStatus);
+        sheet.getRange(i + 1, 5).setValue(new Date());
+
+      } catch (innerErr) {
+        sheet.getRange(i + 1, 3).setValue("⚠️ Error");
+        sheet.getRange(i + 1, 4).setValue("⚠️ Error");
+        sheet.getRange(i + 1, 5).setValue(new Date());
+      }
+    }
+
+  } catch (err) {
+    status = "ERROR";
+    errorMessage = err.message;
+  } finally {
+    const runtime = (Date.now() - start) / 1000;
+    try {
+      const logSheet = SpreadsheetApp.openById("18NPm8ZUkskHxTPqRrDrNTwlujlWDInJcHEVuPeJqSUg").getSheetByName("NEXUS_Engine_Health_Log");
+      if (logSheet) {
+        logSheet.appendRow([
+          ENGINE,
+          new Date(),
+          status,
+          runtime.toFixed(2) + "s",
+          errorMessage
+        ]);
+      }
+    } catch (logErr) {
+      console.warn("⚠️ Failed to write to engine log:", logErr.message);
+    }
+  }
+}
