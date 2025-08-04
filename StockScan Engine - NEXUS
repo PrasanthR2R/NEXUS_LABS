@@ -6,36 +6,65 @@ function checkInventoryStatus() {
 
   try {
     const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-    const range = sheet.getDataRange();
-    const values = range.getValues();
+    const values = sheet.getDataRange().getValues();
 
     for (let i = 1; i < values.length; i++) {
-      const url = values[i][1]; // Column B = Landing Page URL
+      const url = values[i][1]; // Column B: Landing Page URL
       if (!url) continue;
 
+      let modelTitle = "";
+      let pageStatus = "";
+      let triggeredKeyword = "";
+
       try {
-        const response = UrlFetchApp.fetch(url, {
+        // 1) Fetch page
+        const resp = UrlFetchApp.fetch(url, {
           followRedirects: true,
-          muteHttpExceptions: true
+          muteHttpExceptions: true,
+          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
         });
+        const code = resp.getResponseCode();
+        const html = resp.getContentText();
 
-        const code = response.getResponseCode();
-        const content = response.getContentText().toLowerCase();
-        let modelTitle = "";
-        let pageStatus = "";
+        // 2) Strip scripts, styles, comments
+        const visibleHtml = html
+          .replace(/<script[\s\S]*?<\/script>/gi, '')
+          .replace(/<style[\s\S]*?<\/style>/gi, '')
+          .replace(/<!--[\s\S]*?-->/g, '');
 
-        const titleMatch = content.match(/<title>(.*?)<\/title>/i);
-        if (titleMatch) {
-          modelTitle = titleMatch[1].trim();
-        }
-
-        if (!modelTitle) {
-          const ogTitleMatch = content.match(/<meta property="og:title" content="(.*?)"/i);
-          if (ogTitleMatch) {
-            modelTitle = ogTitleMatch[1].trim();
+        // 3) JSON-LD availability & name
+        let availabilityFlag = null;
+        const ldMatch = html.match(/<script\s+type="application\/ld\+json">([\s\S]*?)<\/script>/i);
+        if (ldMatch) {
+          try {
+            const data = JSON.parse(ldMatch[1]);
+            if (data.offers && data.offers.availability) {
+              const a = data.offers.availability.toLowerCase();
+              availabilityFlag = a.includes("instock") || a.includes("in_stock");
+            }
+            if (data.name) {
+              modelTitle = data.name.trim();
+            }
+          } catch (e) {
+            // ignore bad JSON
           }
         }
 
+        // 4) Title fallbacks
+        if (!modelTitle) {
+          const t = html.match(/<title>(.*?)<\/title>/i);
+          if (t) modelTitle = t[1].trim();
+        }
+        if (!modelTitle) {
+          const o = html.match(/<meta property="og:title" content="(.*?)"/i);
+          if (o) modelTitle = o[1].trim();
+        }
+        if (!modelTitle) {
+          const h = html.match(/<h1[^>]*>(.*?)<\/h1>/i);
+          if (h) modelTitle = h[1].trim();
+        }
+
+        // 5) Full soldIndicators list
         const soldIndicators = [
           "we're sorry, no results were found for your request",
           "no results were found for your request",
@@ -63,23 +92,48 @@ function checkInventoryStatus() {
           'sold.png'
         ];
 
-        const soldOverlayMatch = /<div[^>]*class=["'][^"']*sold[^"']*["'][^>]*>([\s\S]*?)sold([\s\S]*?)<\/div>/i.test(content);
-        const matchesSold = soldIndicators.some(keyword => content.includes(keyword)) || soldOverlayMatch;
+        // 6) Text-based sold check
+        const matchesSoldText = soldIndicators.some(keyword => {
+          if (visibleHtml.toLowerCase().includes(keyword)) {
+            triggeredKeyword = keyword;
+            return true;
+          }
+          return false;
+        });
 
-        if (code === 404 || matchesSold) {
+        // 7) OG-title "sold" check
+        const ogMetaMatch = html.match(/<meta property="og:title" content="(.*?)"/i);
+        const ogMeta = ogMetaMatch ? ogMetaMatch[1].toLowerCase() : "";
+        const matchesSoldMeta = /\bsold\b/.test(ogMeta);
+
+        // 8) Conlon override: if URL is Conlon and page shows "Our Price $", treat as in-stock
+        const isConlon = url.includes("conlonmotorsportsstalbert");
+        const hasConlonPrice = /Our Price\s*\$\s*[\d,]+/i.test(html);
+
+        // 9) Final status logic
+        if (availabilityFlag !== null) {
+          pageStatus = availabilityFlag
+            ? "✅ In-Stock"
+            : "❌ Sold / Unavailable";
+        } else if (isConlon && hasConlonPrice) {
+          pageStatus = "✅ In-Stock";
+        } else if (code === 404 || matchesSoldText || matchesSoldMeta) {
           pageStatus = "❌ Sold / Unavailable";
         } else {
           pageStatus = "✅ In-Stock";
         }
 
+        // 10) Write back
         sheet.getRange(i + 1, 3).setValue(modelTitle || "–");
         sheet.getRange(i + 1, 4).setValue(pageStatus);
         sheet.getRange(i + 1, 5).setValue(new Date());
+        sheet.getRange(i + 1, 6).setValue(triggeredKeyword || "–");
 
       } catch (innerErr) {
         sheet.getRange(i + 1, 3).setValue("⚠️ Error");
         sheet.getRange(i + 1, 4).setValue("⚠️ Error");
         sheet.getRange(i + 1, 5).setValue(new Date());
+        sheet.getRange(i + 1, 6).setValue(innerErr.message);
       }
     }
 
@@ -87,15 +141,17 @@ function checkInventoryStatus() {
     status = "ERROR";
     errorMessage = err.message;
   } finally {
-    const runtime = (Date.now() - start) / 1000;
+    const runtime = ((Date.now() - start) / 1000).toFixed(2) + "s";
     try {
-      const logSheet = SpreadsheetApp.openById("18NPm8ZUkskHxTPqRrDrNTwlujlWDInJcHEVuPeJqSUg").getSheetByName("NEXUS_Engine_Health_Log");
+      const logSheet = SpreadsheetApp
+        .openById("18NPm8ZUkskHxTPqRrDrNTwlujlWDInJcHEVuPeJqSUg")
+        .getSheetByName("NEXUS_Engine_Health_Log");
       if (logSheet) {
         logSheet.appendRow([
           ENGINE,
           new Date(),
           status,
-          runtime.toFixed(2) + "s",
+          runtime,
           errorMessage
         ]);
       }
