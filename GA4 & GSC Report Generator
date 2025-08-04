@@ -1,0 +1,514 @@
+/**
+ * @file SEO Monthly Report Engine (GA4 All Channels, Organic Traffic & GSC)
+ * @description This script generates a monthly SEO performance report for multiple
+ * dealer properties, pulling core GA4 metrics for both overall property traffic
+ * and aggregated organic traffic, as well as Google Search Console (GSC) data
+ * for the previous full month.
+ */
+
+// --- Configuration Constants ---
+const INPUT_SHEET_ID = '18NPm8ZUkskHxTPqRrDrNTwlujlWDInJcHEVuPeJqSUg';
+const INPUT_TAB_NAME = 'SEO Dealer Property Mapping';
+const OUTPUT_SHEET_ID = '1c_BDa9rIqDILgq0u0wDUJzgUnxPzaQECGOo07k37mRI';
+const OUTPUT_TAB_NAME = 'Updated KPI';
+
+// --- Hard-coded list of conversion event names to exclude from totals ---
+const EXCLUDED_CONVERSION_EVENTS = [
+  'page_views',
+  'user_engagement',
+  'session_start',
+  'first_visit',
+  'scroll',
+  'view_search_results',
+  'video_progress',
+  'video_start',
+  'click',
+  'file_download'
+];
+
+// --- Main Report Generation Function ---
+function SEO_Monthly_Report_Engine() {
+  const startTime = new Date();
+  let status = 'Success';
+  let errorMsg = '';
+
+  try {
+    const inputSpreadsheet = SpreadsheetApp.openById(INPUT_SHEET_ID);
+    const inputSheet = inputSpreadsheet.getSheetByName(INPUT_TAB_NAME);
+    if (!inputSheet) {
+      throw new Error(`Input tab "${INPUT_TAB_NAME}" not found in sheet ID "${INPUT_SHEET_ID}".`);
+    }
+
+    const outputSpreadsheet = SpreadsheetApp.openById(OUTPUT_SHEET_ID);
+    const outputSheet = outputSpreadsheet.getSheetByName(OUTPUT_TAB_NAME);
+    if (!outputSheet) {
+      throw new Error(`Output tab "${OUTPUT_TAB_NAME}" not found in sheet ID "${OUTPUT_SHEET_ID}".`);
+    }
+
+    // Get all rows from the input sheet, skipping the header (slice(1))
+    const inputRows = inputSheet.getDataRange().getValues().slice(1);
+
+    // --- Date Range Calculation (Full Previous Month) ---
+    const today = new Date();
+    const reportMonthStart = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+    const reportMonthEnd = new Date(today.getFullYear(), today.getMonth(), 0);
+
+    const reportPeriodStr = `${formatDate(reportMonthStart)} to ${formatDate(reportMonthEnd)}`;
+
+    // --- Clear and Set Headers for Output Sheet ---
+    outputSheet.clearContents();
+    outputSheet.appendRow([
+      "Dealer Name",
+      "Report Period",
+      // All Channels Metrics
+      "Total Users (All)",
+      "New Users (All)",
+      "Sessions (All)",
+      "Engaged Sessions (All)",
+      "Engagement Rate (All)",
+      "Avg. Engagement Time (s) (All)",
+      "Total Conversions (All Channels)",
+      "Excluded Conversions (All)", // New column
+      // Organic Traffic Metrics (GA4)
+      "Organic Sessions",
+      "Organic New Users",
+      "Organic Engaged Sessions",
+      "Organic Engagement Rate",
+      "Organic Avg. Engagement Time (s)",
+      "Organic Conversions",
+      "Excluded Conversions (Organic)", // New column
+      // GSC Metrics
+      "Organic Impressions (GSC)",
+      "Organic Clicks (GSC)",
+      "Avg. Organic Position (GSC)",
+      "Avg. Organic CTR (GSC)",
+      "Error / Notes"
+    ]);
+
+    // --- Process Each Dealer ---
+    inputRows.forEach((row, index) => {
+      // Assuming columns: 0: Active, 1: DealerName, 2: WebsiteURL, 3: GA4PropertyID
+      const isActive = row[0];
+      const dealerName = row[1];
+      const websiteUrl = row[2];
+      const ga4PropertyId = row[3];
+
+      // Skip if not active or essential data is missing
+      if (!isActive || !dealerName || !ga4PropertyId) {
+        console.warn(`Skipping row ${index + 2}: Incomplete or inactive dealer data.`);
+        return;
+      }
+
+      let dealerError = '';
+
+      try {
+        // Fetch All Channels GA4 Metrics
+        const allChannelsMetrics = getGA4MetricsAllChannels(
+          ga4PropertyId,
+          formatDate(reportMonthStart), formatDate(reportMonthEnd)
+        );
+
+        // Fetch Organic Traffic GA4 Metrics
+        const organicTrafficMetrics = getGA4MetricsOrganicTraffic(
+          ga4PropertyId,
+          formatDate(reportMonthStart), formatDate(reportMonthEnd)
+        );
+
+        // Fetch GSC Metrics - Only if WebsiteURL is available
+        let gscMetrics = {
+          impressions: 'N/A',
+          clicks: 'N/A',
+          avgPosition: 'N/A',
+          avgCTR: 'N/A'
+        };
+        if (websiteUrl) {
+          try {
+            gscMetrics = getGSCMetrics(
+              websiteUrl,
+              formatDate(reportMonthStart), formatDate(reportMonthEnd)
+            );
+          } catch (gscErr) {
+            dealerError += `GSC Error: ${gscErr.message}. `;
+            console.error(`GSC Error for ${dealerName}: ${gscErr.message}`);
+          }
+        } else {
+          dealerError += `Website URL missing for GSC. `;
+        }
+
+        // Append data for the current dealer to the output sheet
+        outputSheet.appendRow([
+          dealerName,
+          reportPeriodStr,
+          // All Channels Metrics
+          allChannelsMetrics.totalUsers,
+          allChannelsMetrics.newUsers,
+          allChannelsMetrics.sessions,
+          allChannelsMetrics.engagedSessions,
+          allChannelsMetrics.engagementRate,
+          allChannelsMetrics.averageEngagementTime,
+          allChannelsMetrics.totalConversions,
+          allChannelsMetrics.excludedConversionsFound, // New data point
+          // Organic Traffic Metrics (GA4)
+          organicTrafficMetrics.sessions,
+          organicTrafficMetrics.newUsers,
+          organicTrafficMetrics.engagedSessions,
+          organicTrafficMetrics.engagementRate,
+          organicTrafficMetrics.averageEngagementTime,
+          organicTrafficMetrics.totalConversions,
+          organicTrafficMetrics.excludedConversionsFound, // New data point
+          // GSC Metrics
+          gscMetrics.impressions,
+          gscMetrics.clicks,
+          gscMetrics.avgPosition,
+          gscMetrics.avgCTR,
+          dealerError
+        ]);
+
+      } catch (dealerErr) {
+        dealerError = `GA4 Error: ${dealerErr.message}`;
+        console.error(`Main Error for ${dealerName}: ${dealerErr.message}`);
+        // Append row with error message if data fetching fails for a specific dealer
+        outputSheet.appendRow([
+          dealerName,
+          reportPeriodStr,
+          'N/A', 'N/A', 'N/A', 'N/A', 'N/A', 'N/A', 'N/A', 'N/A',
+          'N/A', 'N/A', 'N/A', 'N/A', 'N/A', 'N/A', 'N/A',
+          'N/A', 'N/A', 'N/A', 'N/A',
+          dealerError
+        ]);
+      }
+    });
+
+  } catch (err) {
+    status = 'Failed';
+    errorMsg = err.message;
+    console.error(`Script failed: ${errorMsg}`);
+  } finally {
+    logSEOEngineHealth(startTime, status, errorMsg);
+  }
+}
+
+// --- Helper Functions ---
+
+/**
+ * Fetches Google Analytics 4 (GA4) metrics for the entire property (All Channels).
+ * @param {string} propertyId The GA4 property ID (e.g., 'properties/123456789').
+ * @param {string} startDate Start date for the reporting period (YYYY-MM-DD).
+ * @param {string} endDate End date for the reporting period (YYYY-MM-DD).
+ * @returns {object} An object containing the requested GA4 metrics.
+ */
+function getGA4MetricsAllChannels(propertyId, startDate, endDate) {
+  const token = ScriptApp.getOAuthToken();
+  const url = `https://analyticsdata.googleapis.com/v1beta/properties/${propertyId}:runReport`;
+
+  const requestBody = {
+    metrics: [
+      { name: "totalUsers" },
+      { name: "newUsers" },
+      { name: "sessions" },
+      { name: "engagedSessions" },
+      { name: "engagementRate" },
+      { name: "averageSessionDuration" },
+      { name: "conversions" }
+    ],
+    dateRanges: [
+      { startDate: startDate, endDate: endDate }
+    ],
+    dimensions: [{ name: "eventName" }],
+    keepEmptyRows: true
+  };
+
+  const options = {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json'
+    },
+    payload: JSON.stringify(requestBody),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  if (response.getResponseCode() !== 200) {
+    throw new Error(`GA4 API All Channels Metrics Error (HTTP ${response.getResponseCode()}): ${response.getContentText()}`);
+  }
+
+  const data = JSON.parse(response.getContentText());
+
+  if (data.error) {
+    throw new Error(`GA4 API All Channels Metrics Error: ${JSON.stringify(data.error)}`);
+  }
+
+  const getNumericMetric = (row, metricIndex) => {
+    const value = row?.metricValues?.[metricIndex]?.value;
+    return value ? parseFloat(value) : 0;
+  };
+
+  const metrics = {
+    totalUsers: 0,
+    newUsers: 0,
+    sessions: 0,
+    engagedSessions: 0,
+    engagementRate: "0.00%",
+    averageEngagementTime: 0,
+    totalConversions: 0
+  };
+  const excludedEventsFound = [];
+
+  if (data.rows && data.rows.length > 0) {
+    let totalUsers = 0;
+    let totalNewUsers = 0;
+    let totalSessions = 0;
+    let totalEngagedSessions = 0;
+    let totalEngagementRate = 0;
+    let totalAvgSessionDuration = 0;
+    let totalConversions = 0;
+    let rowCount = 0;
+
+    data.rows.forEach(row => {
+      const eventName = row.dimensionValues[0].value;
+      if (EXCLUDED_CONVERSION_EVENTS.includes(eventName)) {
+        // If the event is in the exclusion list, add it to our found list
+        excludedEventsFound.push(eventName);
+      } else {
+        // Otherwise, add its metrics to the totals
+        totalUsers += Math.round(getNumericMetric(row, 0));
+        totalNewUsers += Math.round(getNumericMetric(row, 1));
+        totalSessions += Math.round(getNumericMetric(row, 2));
+        totalEngagedSessions += Math.round(getNumericMetric(row, 3));
+        totalEngagementRate += getNumericMetric(row, 4);
+        totalAvgSessionDuration += getNumericMetric(row, 5);
+        totalConversions += Math.round(getNumericMetric(row, 6));
+        rowCount++;
+      }
+    });
+
+    metrics.totalUsers = totalUsers;
+    metrics.newUsers = totalNewUsers;
+    metrics.sessions = totalSessions;
+    metrics.engagedSessions = totalEngagedSessions;
+    metrics.engagementRate = `${(totalEngagementRate * 100 / rowCount).toFixed(2)}%`;
+    metrics.averageEngagementTime = (totalAvgSessionDuration / rowCount).toFixed(2);
+    metrics.totalConversions = totalConversions;
+  }
+
+  metrics.excludedConversionsFound = excludedEventsFound.join(', ');
+  return metrics;
+}
+
+/**
+ * Fetches aggregated Google Analytics 4 (GA4) metrics for Organic Traffic.
+ * @param {string} propertyId The GA4 property ID.
+ * @param {string} startDate Start date for the reporting period (YYYY-MM-DD).
+ * @param {string} endDate End date for the reporting period (YYYY-MM-DD).
+ * @returns {object} An object containing the requested organic GA4 metrics.
+ */
+function getGA4MetricsOrganicTraffic(propertyId, startDate, endDate) {
+  const token = ScriptApp.getOAuthToken();
+  const url = `https://analyticsdata.googleapis.com/v1beta/properties/${propertyId}:runReport`;
+
+  const requestBody = {
+    dimensions: [
+      { name: "sessionDefaultChannelGroup" },
+      { name: "eventName" }
+    ],
+    dimensionFilter: {
+      filter: {
+        fieldName: "sessionDefaultChannelGroup",
+        stringFilter: {
+          matchType: "CONTAINS",
+          value: "Organic"
+        }
+      }
+    },
+    metrics: [
+      { name: "sessions" },
+      { name: "newUsers" },
+      { name: "engagedSessions" },
+      { name: "engagementRate" },
+      { name: "averageSessionDuration" },
+      { name: "conversions" }
+    ],
+    dateRanges: [
+      { startDate: startDate, endDate: endDate }
+    ],
+    keepEmptyRows: true
+  };
+
+  const options = {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json'
+    },
+    payload: JSON.stringify(requestBody),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  if (response.getResponseCode() !== 200) {
+    throw new Error(`GA4 API Organic Traffic Metrics Error (HTTP ${response.getResponseCode()}): ${response.getContentText()}`);
+  }
+
+  const data = JSON.parse(response.getContentText());
+
+  if (data.error) {
+    throw new Error(`GA4 API Organic Traffic Metrics Error: ${JSON.stringify(data.error)}`);
+  }
+
+  const getNumericMetric = (row, metricIndex) => {
+    const value = row?.metricValues?.[metricIndex]?.value;
+    return value ? parseFloat(value) : 0;
+  };
+
+  const metrics = {
+    sessions: 0,
+    newUsers: 0,
+    engagedSessions: 0,
+    engagementRate: "0.00%",
+    averageEngagementTime: 0,
+    totalConversions: 0
+  };
+  const excludedEventsFound = [];
+
+  if (data.rows && data.rows.length > 0) {
+    let totalSessions = 0;
+    let totalNewUsers = 0;
+    let totalEngagedSessions = 0;
+    let totalEngagementRateSum = 0;
+    let totalAverageSessionDurationSum = 0;
+    let totalConversions = 0;
+    let rowCount = 0;
+
+    data.rows.forEach(row => {
+      const eventName = row.dimensionValues[1].value;
+      if (EXCLUDED_CONVERSION_EVENTS.includes(eventName)) {
+        excludedEventsFound.push(eventName);
+      } else {
+        totalSessions += Math.round(getNumericMetric(row, 0));
+        totalNewUsers += Math.round(getNumericMetric(row, 1));
+        totalEngagedSessions += Math.round(getNumericMetric(row, 2));
+        totalEngagementRateSum += getNumericMetric(row, 3);
+        totalAverageSessionDurationSum += getNumericMetric(row, 4);
+        totalConversions += Math.round(getNumericMetric(row, 5));
+        rowCount++;
+      }
+    });
+
+    metrics.sessions = totalSessions;
+    metrics.newUsers = totalNewUsers;
+    metrics.engagedSessions = totalEngagedSessions;
+
+    if (rowCount > 0) {
+      metrics.engagementRate = `${((totalEngagementRateSum / rowCount) * 100).toFixed(2)}%`;
+      metrics.averageEngagementTime = (totalAverageSessionDurationSum / rowCount).toFixed(2);
+    }
+    metrics.totalConversions = totalConversions;
+  }
+  
+  metrics.excludedConversionsFound = excludedEventsFound.join(', ');
+  return metrics;
+}
+
+/**
+ * Fetches Google Search Console (GSC) metrics for the specified site.
+ * @param {string} siteUrl The GSC site URL (e.g., 'sc-domain:example.com' or 'https://example.com/').
+ * @param {string} startDate Start date for the reporting period (YYYY-MM-DD).
+ * @param {string} endDate End date for the reporting period (YYYY-MM-DD).
+ * @returns {object} An object containing GSC metrics: impressions, clicks, avgPosition, avgCTR.
+ */
+function getGSCMetrics(siteUrl, startDate, endDate) {
+  const token = ScriptApp.getOAuthToken();
+  const url = `https://searchconsole.googleapis.com/webmasters/v3/sites/${encodeURIComponent(siteUrl)}/searchAnalytics/query`;
+
+  const payload = {
+    startDate,
+    endDate,
+    dimensions: ["date"],
+  };
+
+  const options = {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json'
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  if (response.getResponseCode() !== 200) {
+    throw new Error(`GSC API Error (HTTP ${response.getResponseCode()}): ${response.getContentText()}`);
+  }
+
+  const data = JSON.parse(response.getContentText());
+
+  if (data.error) {
+    throw new Error(`GSC API Error: ${JSON.stringify(data.error)}`);
+  }
+
+  let totalImpressions = 0;
+  let totalClicks = 0;
+  let totalPosition = 0;
+  let rowCount = 0;
+
+  if (data.rows) {
+    data.rows.forEach(row => {
+      totalImpressions += (row.impressions || 0);
+      totalClicks += (row.clicks || 0);
+      totalPosition += (row.position || 0);
+      rowCount++;
+    });
+  }
+
+  const avgPosition = rowCount > 0 ? (totalPosition / rowCount) : 0;
+  const ctr = totalImpressions > 0 ? (totalClicks / totalImpressions) : 0;
+
+  return {
+    impressions: Math.round(totalImpressions),
+    clicks: Math.round(totalClicks),
+    avgPosition: parseFloat(avgPosition.toFixed(2)),
+    avgCTR: `${(ctr * 100).toFixed(2)}%`
+  };
+}
+
+/**
+ * Formats a Date object into a YYYY-MM-DD string.
+ * @param {Date} date The date object to format.
+ * @returns {string} Formatted date string.
+ */
+function formatDate(date) {
+  return Utilities.formatDate(date, "GMT", "yyyy-MM-dd");
+}
+
+/**
+ * Logs the health and runtime of the SEO Monthly Report Engine.
+ * @param {Date} startTime The start time of the script execution.
+ * @param {string} status The final status of the script ('Success' or 'Failed').
+ * @param {string} errorMsg Any error message if the script failed.
+ */
+function logSEOEngineHealth(startTime, status, errorMsg) {
+  const end = new Date();
+  const runtime = ((end.getTime() - startTime.getTime()) / 1000).toFixed(1);
+  const logSheetId = INPUT_SHEET_ID;
+  const logSheetName = 'NEXUS_Engine_Health_Log';
+
+  try {
+    const sheet = SpreadsheetApp.openById(logSheetId);
+    const logSheet = sheet.getSheetByName(logSheetName);
+    if (!logSheet) {
+      console.error(`Log sheet "${logSheetName}" not found in sheet ID "${logSheetId}". Skipping health log.`);
+      return;
+    }
+    logSheet.appendRow([
+      'SEO Monthly Report Engine',
+      new Date().toLocaleString(),
+      status,
+      `${runtime}s`,
+      errorMsg || ''
+    ]);
+  } catch (e) {
+    console.error(`Failed to log script health: ${e.message}`);
+  }
+}
