@@ -1,14 +1,32 @@
+function writeEngineLog(engineName, status, runtimeSeconds, error) {
+  try {
+    const ss = SpreadsheetApp.openById("18NPm8ZUkskHxTPqRrDrNTwlujlWDInJcHEVuPeJqSUg");
+    const sheet = ss.getSheetByName("NEXUS_Engine_Health_Log");
+    if (!sheet) return;
+ 
+    const row = [
+      engineName,
+      new Date(),
+      status,
+      runtimeSeconds ? runtimeSeconds.toFixed(2) + 's' : '',
+      error || ''
+    ];
+    sheet.appendRow(row);
+  } catch (err) {
+    console.error('Failed to log to Engine Health sheet:', err.message);
+  }
+}
 /**
  * BASECAMP ⇄ SHEETS ⇄ TEAMS – Full Integration
  * Automatically adds a “Team Response” column and logs each “I’m On It” RSVP there.
  */
-
+ 
 const BASECAMP_ACCOUNT_ID = '5796684';
 const TEAMS_WEBHOOK_URL   = PropertiesService.getScriptProperties().getProperty('TEAMS_WEBHOOK_URL');
 const WEBAPP_URL          = PropertiesService.getScriptProperties().getProperty('TEAMS_WEBHOOK_SECRET');
 const ACCESS_TOKEN        = PropertiesService.getScriptProperties().getProperty('ACCESS_TOKEN');
 const FILTER_TEAMS        = ['Performance Team','Digital Ads Dept.','Creative'];
-
+ 
 /** ===== 0. Post cards to Teams ===== */
 function sendCardToTeams(card) {
   if (!TEAMS_WEBHOOK_URL) return;
@@ -20,7 +38,7 @@ function sendCardToTeams(card) {
   });
   console.log('Teams responded:', res.getResponseCode());
 }
-
+ 
 /** ===== Helpers ===== */
 function stripHtml(html) {
   return html
@@ -30,7 +48,7 @@ function stripHtml(html) {
           .trim()
     : '';
 }
-
+ 
 function cachedFetchJSON(url, params = {}, context = '') {
   const key = Utilities.base64EncodeWebSafe(`${context}|${url}`);
   const cache = CacheService.getScriptCache();
@@ -42,19 +60,19 @@ function cachedFetchJSON(url, params = {}, context = '') {
   try { cache.put(key, body, 3*60*60); } catch(e){}
   return JSON.parse(body);
 }
-
+ 
 function getOrCreateSheet(ss, name) {
   let s = ss.getSheetByName(name);
   if (!s) s = ss.insertSheet(name);
   return s;
 }
-
+ 
 function resetSheet(sheet, headers) {
   sheet.clearContents();
   sheet.appendRow(headers);
   sheet.setFrozenRows(1);
 }
-
+ 
 /** ===== 1. Sync Team-Assigned Tasks ===== */
 function syncTeamAssignedTasks() {
   if (!ACCESS_TOKEN) throw new Error('ACCESS_TOKEN missing');
@@ -72,7 +90,7 @@ function syncTeamAssignedTasks() {
     {label:'trashed',  url:`https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/projects.json?status=trashed`}
   ];
   const rows = [];
-
+ 
   statuses.forEach(st => {
     let page = 1;
     while (true) {
@@ -112,7 +130,7 @@ function syncTeamAssignedTasks() {
       page++;
     }
   });
-
+ 
   // write + trim
   resetSheet(sheet, headerRow);
   if (rows.length) {
@@ -121,24 +139,24 @@ function syncTeamAssignedTasks() {
   }
   const last = rows.length + 1, total = sheet.getMaxRows();
   if (total > last) sheet.deleteRows(last+1, total-last);
-
+ 
   ss.toast('✅ Synced assigned todos','Basecamp Sync');
 }
-
+ 
 /** ===== 2. Handle “Mark Done” edits ===== */
 function handleEdit(e) {
   const sh = e.range.getSheet();
   if (sh.getName()!=='🧑‍💼 Team Assigned Tasks') return;
   const markDoneCol = 13;
   if (e.range.getColumn() !== markDoneCol) return;
-
+ 
   const checked = e.value === 'TRUE', row = e.range.getRow();
   const url     = sh.getRange(row,11).getValue();
   const bid     = url.match(/buckets\/(\d+)/)[1];
   const todoId  = url.match(/todos\/(\d+)/)[1];
   const method  = checked ? 'post' : 'delete';
   const apiUrl  = `https://3.basecampapi.com/${BASECAMP_ACCOUNT_ID}/buckets/${bid}/todos/${todoId}/completion.json`;
-
+ 
   try {
     const res = UrlFetchApp.fetch(apiUrl, {
       method,
@@ -165,13 +183,13 @@ function handleEdit(e) {
     SpreadsheetApp.getActiveSpreadsheet().toast('Error: '+err.message,'Error');
   }
 }
-
+ 
 /** ===== 3. Morning Digest w/ “I’m On It” ===== */
 function sendMorningDigest() {
   const ss    = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName('🧑‍💼 Team Assigned Tasks');
   if (!sheet) throw new Error('Tasks sheet not found');
-
+ 
   const data   = sheet.getDataRange().getValues();
   const header = data.shift();
   const i      = name=>header.indexOf(name);
@@ -183,7 +201,7 @@ function sendMorningDigest() {
   const yest  = Utilities.formatDate(new Date(Date.now()-864e5),tz,'yyyy-MM-dd');
   const map   = getDealerManagerMap();
   const groups = {};
-
+ 
   data.forEach(r=>{
     const created = r[cI] instanceof Date
                   ? Utilities.formatDate(r[cI],tz,'yyyy-MM-dd') : '';
@@ -202,7 +220,7 @@ function sendMorningDigest() {
     }
   });
   if (!Object.keys(groups).length) return;
-
+ 
   const sections = Object.entries(groups).map(([mgr,tickets])=>({
     activityTitle:`**@${mgr}**`,
     facts: tickets.map(t=>({
@@ -216,7 +234,7 @@ function sendMorningDigest() {
     display:`${t.title} (${t.project})`,
     value:t.ticketId
   }));
-
+ 
   const card = {
     "@type":"MessageCard","@context":"http://schema.org/extensions",
     summary:"Morning Digest", themeColor:"0076D7",
@@ -242,16 +260,16 @@ function sendMorningDigest() {
       }
     ]
   };
-
+ 
   sendCardToTeams(card);
 }
-
+ 
 /** ===== 4. End-of-Day Reminder @ 17:00 ===== */
 function sendEODReminder() {
   const ss    = SpreadsheetApp.getActiveSpreadsheet();
   const sh    = ss.getSheetByName('🧑‍💼 Team Assigned Tasks');
   if (!sh) throw new Error('Tasks sheet not found');
-
+ 
   const data   = sh.getDataRange().getValues();
   const hdr    = data.shift();
   const i      = name=>hdr.indexOf(name);
@@ -259,14 +277,14 @@ function sendEODReminder() {
   const titleI = i('Todo Item'), urlI = i('Item URL');
   const tz     = ss.getSpreadsheetTimeZone();
   const today  = Utilities.formatDate(new Date(),tz,'yyyy-MM-dd');
-
+ 
   const pending = data.filter(r=>{
     const due = r[dueI] instanceof Date
               ? Utilities.formatDate(r[dueI],tz,'yyyy-MM-dd') : r[dueI];
     return due===today && r[doneI]!=='✅';
   });
   if (!pending.length) return;
-
+ 
   const bullets = pending.map(r=>`• [${r[titleI]}](${r[urlI]})`).join('\n');
   sendCardToTeams({
     "@type":"MessageCard","@context":"http://schema.org/extensions",
@@ -275,19 +293,19 @@ function sendEODReminder() {
     text: bullets
   });
 }
-
+ 
 /** ===== 5. Sync → Digest ===== */
 function syncThenDigest() {
   syncTeamAssignedTasks();
   sendMorningDigest();
 }
-
+ 
 /** ===== 6. Web-App Handlers with dynamic “Team Response” column ===== */
 function doGet() {
   return ContentService.createTextOutput('OK')
                        .setMimeType(ContentService.MimeType.TEXT);
 }
-
+ 
 function doPost(e) {
   // merge JSON + form params
   let payload = {};
@@ -296,13 +314,13 @@ function doPost(e) {
   }
   payload = Object.assign({}, payload, e.parameter);
   console.log('Payload:', payload);
-
+ 
   if (payload.ticketId) {
     const ss    = SpreadsheetApp.getActiveSpreadsheet();
     const sheet = ss.getSheetByName('🧑‍💼 Team Assigned Tasks');
     const data  = sheet.getDataRange().getValues();
     const header = data.shift();
-
+ 
     // ensure “Team Response” column exists
     let respCol = header.indexOf('Team Response');
     if (respCol < 0) {
@@ -310,7 +328,7 @@ function doPost(e) {
       sheet.insertColumnAfter(respCol);
       sheet.getRange(1, respCol+1).setValue('Team Response');
     }
-
+ 
     // find matching row by ticketId
     const urlCol = header.indexOf('Item URL');
     const user   = Session.getActiveUser().getEmail() || 'someone';
@@ -325,7 +343,7 @@ function doPost(e) {
     return ContentService.createTextOutput('OK')
                          .setMimeType(ContentService.MimeType.TEXT);
   }
-
+ 
   // fallback: post new Basecamp ticket to Teams
   try {
     const title   = payload.content || payload.title;
@@ -348,7 +366,7 @@ function doPost(e) {
     return ContentService.createTextOutput('Error').setStatusCode(500);
   }
 }
-
+ 
 /** ===== Config reader ===== */
 function getDealerManagerMap() {
   const ss  = SpreadsheetApp.getActiveSpreadsheet();
@@ -358,4 +376,85 @@ function getDealerManagerMap() {
   return data
     .filter(r=>r[0]&&r[1])
     .map(r=>({ dealerPattern:r[0].toString().trim(), manager:r[1].toString().trim() }));
+}
+function runBasecampTrackerEngine() {
+  const start = Date.now();
+  const ENGINE = "Basecamp TaskLink Engine - NEXUS";
+ 
+  try {
+    syncTeamAssignedTasks();
+    sendMorningDigest();
+    writeEngineLog(ENGINE, "OK", (Date.now() - start) / 1000, "");
+  } catch (err) {
+    writeEngineLog(ENGINE, "ERROR", (Date.now() - start) / 1000, err.message);
+    throw err;
+  }
+}
+function refreshBasecampAccessToken() {
+  const CLIENT_ID     = '6b4c8ea31ab4e4d8c5dfc59cf3804eb525141a7c';
+  const CLIENT_SECRET = '3380f74a6d975a2caefe83c8530e70c14a63ee16';
+  const REFRESH_TOKEN = PropertiesService.getScriptProperties().getProperty('REFRESH_TOKEN');
+
+  if (!REFRESH_TOKEN) {
+    Logger.log('❌ No refresh token found.');
+    return;
+  }
+
+  const payload = {
+    type: 'refresh',
+    client_id: CLIENT_ID,
+    client_secret: CLIENT_SECRET,
+    refresh_token: REFRESH_TOKEN
+  };
+
+  const options = {
+    method: 'post',
+    contentType: 'application/x-www-form-urlencoded',
+    payload: payload,
+    muteHttpExceptions: true
+  };
+
+  const url = 'https://launchpad.37signals.com/authorization/token';
+  const res = UrlFetchApp.fetch(url, options);
+  const code = res.getResponseCode();
+  const body = res.getContentText();
+
+  Logger.log('Refresh Response Code: ' + code);
+  Logger.log('Refresh Response Body: ' + body);
+
+  const now = new Date();
+  const logSS = SpreadsheetApp.openById('18NPm8ZUkskHxTPqRrDrNTwlujlWDInJcHEVuPeJqSUg');
+  const logSheet = logSS.getSheetByName('NEXUS_Engine_Health_Log');
+
+  if (code === 200) {
+    const data = JSON.parse(body);
+    const expiresAt = new Date(now.getTime() + data.expires_in * 1000);
+
+    PropertiesService.getScriptProperties().setProperty('ACCESS_TOKEN', data.access_token);
+    if (data.refresh_token) {
+      PropertiesService.getScriptProperties().setProperty('REFRESH_TOKEN', data.refresh_token);
+    }
+    PropertiesService.getScriptProperties().setProperty('EXPIRES_AT', expiresAt.toISOString());
+
+    // Log to NEXUS_Engine_Health_Log
+    logSheet.appendRow([
+      'Basecamp Token Engine',
+      now,
+      'OK',
+      '',
+      `Token refreshed. Expires at: ${expiresAt.toLocaleString()}`
+    ]);
+
+    SpreadsheetApp.getActiveSpreadsheet().toast('✅ Token refreshed successfully', 'Basecamp');
+  } else {
+    // Log failure
+    logSheet.appendRow([
+      'Basecamp Token Engine',
+      now,
+      'ERROR',
+      '',
+      `Refresh failed: ${body}`
+    ]);
+    SpreadsheetApp.getActiveSpreadsheet().toast('❌ Token refresh failed: ' + body, 'Error');
+  }
 }
