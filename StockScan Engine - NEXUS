@@ -5,137 +5,159 @@ function checkInventoryStatus() {
   let errorMessage = "";
 
   try {
-    const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-    const values = sheet.getDataRange().getValues();
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheets = ss.getSheets(); // <<< NEW: iterate all tabs
 
-    for (let i = 1; i < values.length; i++) {
-      const url = values[i][1]; // Column B: Landing Page URL
-      if (!url) continue;
-
-      let modelTitle = "";
-      let pageStatus = "";
-      let triggeredKeyword = "";
-
+    for (const sheet of sheets) {
+      // Keep your original per-sheet logic exactly the same below
       try {
-        // 1) Fetch page
-        const resp = UrlFetchApp.fetch(url, {
-          followRedirects: true,
-          muteHttpExceptions: true,
-          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
-        });
-        const code = resp.getResponseCode();
-        const html = resp.getContentText();
+        const values = sheet.getDataRange().getValues();
 
-        // 2) Strip scripts, styles, comments
-        const visibleHtml = html
-          .replace(/<script[\s\S]*?<\/script>/gi, '')
-          .replace(/<style[\s\S]*?<\/style>/gi, '')
-          .replace(/<!--[\s\S]*?-->/g, '');
+        for (let i = 1; i < values.length; i++) {
+          const url = values[i][1]; // Column B: Landing Page URL
+          if (!url) continue;
 
-        // 3) JSON-LD availability & name
-        let availabilityFlag = null;
-        const ldMatch = html.match(/<script\s+type="application\/ld\+json">([\s\S]*?)<\/script>/i);
-        if (ldMatch) {
+          let modelTitle = "";
+          let pageStatus = "";
+          let triggeredKeyword = "";
+
           try {
-            const data = JSON.parse(ldMatch[1]);
-            if (data.offers && data.offers.availability) {
-              const a = data.offers.availability.toLowerCase();
-              availabilityFlag = a.includes("instock") || a.includes("in_stock");
+            // 1) Fetch page
+            const resp = UrlFetchApp.fetch(url, {
+              followRedirects: true,
+              muteHttpExceptions: true,
+              headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+            });
+            const code = resp.getResponseCode();
+            const html = resp.getContentText();
+
+            // >>> NEW (kept from prior fix): detect dealer + "Marked Down" badge
+            const domain = url.replace(/^https?:\/\/(www\.)?/i, '').split('/')[0].toLowerCase();
+            const isNeessenOrNissanOutdoors = /(neessenoutdoors|nissanoutdoors)\.com$/i.test(domain);
+            const hasMarkedDownBadge =
+              /class\s*=\s*["'][^"']*markeddown[^"']*["']/i.test(html) ||   // class="... markeddown ..."
+              />\s*marked\s*down!?[^<]*</i.test(html);                      // visible text "MARKED DOWN!!"
+            // <<< END NEW
+
+            // 2) Strip scripts, styles, comments
+            const visibleHtml = html
+              .replace(/<script[\s\S]*?<\/script>/gi, '')
+              .replace(/<style[\s\S]*?<\/style>/gi, '')
+              .replace(/<!--[\s\S]*?-->/g, '');
+
+            // 3) JSON-LD availability & name
+            let availabilityFlag = null;
+            const ldMatch = html.match(/<script\s+type="application\/ld\+json">([\s\S]*?)<\/script>/i);
+            if (ldMatch) {
+              try {
+                const data = JSON.parse(ldMatch[1]);
+                if (data.offers && data.offers.availability) {
+                  const a = data.offers.availability.toLowerCase();
+                  availabilityFlag = a.includes("instock") || a.includes("in_stock");
+                }
+                if (data.name) {
+                  modelTitle = data.name.trim();
+                }
+              } catch (e) {
+                // ignore bad JSON
+              }
             }
-            if (data.name) {
-              modelTitle = data.name.trim();
+
+            // 4) Title fallbacks
+            if (!modelTitle) {
+              const t = html.match(/<title>(.*?)<\/title>/i);
+              if (t) modelTitle = t[1].trim();
             }
-          } catch (e) {
-            // ignore bad JSON
+            if (!modelTitle) {
+              const o = html.match(/<meta property="og:title" content="(.*?)"/i);
+              if (o) modelTitle = o[1].trim();
+            }
+            if (!modelTitle) {
+              const h = html.match(/<h1[^>]*>(.*?)<\/h1>/i);
+              if (h) modelTitle = h[1].trim();
+            }
+
+            // 5) Full soldIndicators list
+            const soldIndicators = [
+              "we're sorry, no results were found for your request",
+              "no results were found for your request",
+              "no results were found",
+              "unit is no longer available",
+              "unit not found",
+              "this page is no longer available",
+              "inventory not found",
+              "inventory item not found",
+              "no longer in our inventory",
+              "this vehicle is not available",
+              "this unit has been sold",
+              "search returned no results",
+              "your search returned no matches",
+              "home › 404 error page",
+              "we have much cooler pages",
+              "sorry, the page you are looking for is no longer available",
+              "unfortunately, we couldn’t find what you’re looking for",
+              'class="overlay_txt sold"',
+              'class="image_overlay visible sold"',
+              '>sold<',
+              '">sold<',
+              'alt="sold"',
+              'data-status="sold"',
+              'sold.png'
+            ];
+
+            // 6) Text-based sold check
+            const matchesSoldText = soldIndicators.some(keyword => {
+              if (visibleHtml.toLowerCase().includes(keyword)) {
+                triggeredKeyword = keyword;
+                return true;
+              }
+              return false;
+            });
+
+            // 7) OG-title "sold" check
+            const ogMetaMatch = html.match(/<meta property="og:title" content="(.*?)"/i);
+            const ogMeta = ogMetaMatch ? ogMetaMatch[1].toLowerCase() : "";
+            const matchesSoldMeta = /\bsold\b/.test(ogMeta);
+
+            // 8) Conlon override: if URL is Conlon and page shows "Our Price $", treat as in-stock
+            const isConlon = url.includes("conlonmotorsportsstalbert");
+            const hasConlonPrice = /Our Price\s*\$\s*[\d,]+/i.test(html);
+
+            // 9) Final status logic
+            if (availabilityFlag !== null) {
+              pageStatus = availabilityFlag
+                ? "✅ In-Stock"
+                : "❌ Sold / Unavailable";
+            } else if (isConlon && hasConlonPrice) {
+              pageStatus = "✅ In-Stock";
+            } else if (isNeessenOrNissanOutdoors && hasMarkedDownBadge) { // NEW
+              pageStatus = "❌ Sold / Unavailable";
+              triggeredKeyword = "neessen:markeddown-badge";
+            } else if (code === 404 || matchesSoldText || matchesSoldMeta) {
+              pageStatus = "❌ Sold / Unavailable";
+            } else {
+              pageStatus = "✅ In-Stock";
+            }
+
+            // 10) Write back (Columns C, D, E, F) ON THIS SHEET
+            sheet.getRange(i + 1, 3).setValue(modelTitle || "–");
+            sheet.getRange(i + 1, 4).setValue(pageStatus);
+            sheet.getRange(i + 1, 5).setValue(new Date());
+            sheet.getRange(i + 1, 6).setValue(triggeredKeyword || "–");
+
+          } catch (innerErr) {
+            sheet.getRange(i + 1, 3).setValue("⚠️ Error");
+            sheet.getRange(i + 1, 4).setValue("⚠️ Error");
+            sheet.getRange(i + 1, 5).setValue(new Date());
+            sheet.getRange(i + 1, 6).setValue(innerErr.message);
           }
         }
-
-        // 4) Title fallbacks
-        if (!modelTitle) {
-          const t = html.match(/<title>(.*?)<\/title>/i);
-          if (t) modelTitle = t[1].trim();
-        }
-        if (!modelTitle) {
-          const o = html.match(/<meta property="og:title" content="(.*?)"/i);
-          if (o) modelTitle = o[1].trim();
-        }
-        if (!modelTitle) {
-          const h = html.match(/<h1[^>]*>(.*?)<\/h1>/i);
-          if (h) modelTitle = h[1].trim();
-        }
-
-        // 5) Full soldIndicators list
-        const soldIndicators = [
-          "we're sorry, no results were found for your request",
-          "no results were found for your request",
-          "no results were found",
-          "unit is no longer available",
-          "unit not found",
-          "this page is no longer available",
-          "inventory not found",
-          "inventory item not found",
-          "no longer in our inventory",
-          "this vehicle is not available",
-          "this unit has been sold",
-          "search returned no results",
-          "your search returned no matches",
-          "home › 404 error page",
-          "we have much cooler pages",
-          "sorry, the page you are looking for is no longer available",
-          "unfortunately, we couldn’t find what you’re looking for",
-          'class="overlay_txt sold"',
-          'class="image_overlay visible sold"',
-          '>sold<',
-          '">sold<',
-          'alt="sold"',
-          'data-status="sold"',
-          'sold.png'
-        ];
-
-        // 6) Text-based sold check
-        const matchesSoldText = soldIndicators.some(keyword => {
-          if (visibleHtml.toLowerCase().includes(keyword)) {
-            triggeredKeyword = keyword;
-            return true;
-          }
-          return false;
-        });
-
-        // 7) OG-title "sold" check
-        const ogMetaMatch = html.match(/<meta property="og:title" content="(.*?)"/i);
-        const ogMeta = ogMetaMatch ? ogMetaMatch[1].toLowerCase() : "";
-        const matchesSoldMeta = /\bsold\b/.test(ogMeta);
-
-        // 8) Conlon override: if URL is Conlon and page shows "Our Price $", treat as in-stock
-        const isConlon = url.includes("conlonmotorsportsstalbert");
-        const hasConlonPrice = /Our Price\s*\$\s*[\d,]+/i.test(html);
-
-        // 9) Final status logic
-        if (availabilityFlag !== null) {
-          pageStatus = availabilityFlag
-            ? "✅ In-Stock"
-            : "❌ Sold / Unavailable";
-        } else if (isConlon && hasConlonPrice) {
-          pageStatus = "✅ In-Stock";
-        } else if (code === 404 || matchesSoldText || matchesSoldMeta) {
-          pageStatus = "❌ Sold / Unavailable";
-        } else {
-          pageStatus = "✅ In-Stock";
-        }
-
-        // 10) Write back
-        sheet.getRange(i + 1, 3).setValue(modelTitle || "–");
-        sheet.getRange(i + 1, 4).setValue(pageStatus);
-        sheet.getRange(i + 1, 5).setValue(new Date());
-        sheet.getRange(i + 1, 6).setValue(triggeredKeyword || "–");
-
-      } catch (innerErr) {
-        sheet.getRange(i + 1, 3).setValue("⚠️ Error");
-        sheet.getRange(i + 1, 4).setValue("⚠️ Error");
-        sheet.getRange(i + 1, 5).setValue(new Date());
-        sheet.getRange(i + 1, 6).setValue(innerErr.message);
+      } catch (sheetErr) {
+        // If a specific tab misbehaves, keep going on others
+        errorMessage = (errorMessage ? errorMessage + " | " : "") + `Sheet "${sheet.getName()}": ${sheetErr.message}`;
+        status = "ERROR";
       }
-    }
+    } // end for each sheet
 
   } catch (err) {
     status = "ERROR";
