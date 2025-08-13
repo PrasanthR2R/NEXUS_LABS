@@ -1,0 +1,335 @@
+/*******************************
+ * NEXUS — JIRA TRACKER (Final)
+ * Pulls issues (incl. description) to "Tickets"
+ * Logs run status to your health log sheet
+ *******************************/
+
+/*** CONFIG ***/
+// Jira
+const JIRA_SITE   = 'latcha.atlassian.net';   // hostname only
+const DEFAULT_JQL = 'statusCategory != Done ORDER BY updated DESC'; // edit if needed
+
+// Output tab (in this spreadsheet)
+const TICKETS_TAB = 'Tickets';
+
+// Health log sheet you gave me
+const HEALTH_SHEET_ID = '18NPm8ZUkskHxTPqRrDrNTwlujlWDInJcHEVuPeJqSUg';
+const HEALTH_TAB_NAME = 'NEXUS_Engine_Health_Log'; // columns: Engine Name | Timestamp | Status | Runtime | Error
+
+// Fields to fetch (standard + safe to display). Includes 'description' (ADF).
+const FIELDS = [
+  'project','summary','description','issuetype','status','statuscategorychangedate','assignee',
+  'priority','labels','components','fixVersions','versions',
+  'duedate','created','updated','reporter','resolution','resolutiondate','parent'
+];
+
+/*** ONE-TIME: store secrets, then remove literals ***/
+function setSecrets() {
+  // ⛔️ Replace these with your real creds, run once, then you can delete the literals.
+  const JIRA_EMAIL = 'YOUR_JIRA_EMAIL@company.com';
+  const JIRA_API_TOKEN = 'YOUR_API_TOKEN_HERE';
+
+  if (!JIRA_EMAIL || !JIRA_API_TOKEN) throw new Error('Provide JIRA_EMAIL and JIRA_API_TOKEN.');
+  PropertiesService.getScriptProperties().setProperties({ JIRA_EMAIL, JIRA_API_TOKEN }, true);
+  Logger.log('Secrets saved.');
+}
+
+/*** MAIN: pull issues + write logs ***/
+function Sync_Jira_Issues() {
+  const t0 = new Date();
+  const ENGINE = 'Jira Tracker Engine';
+  try {
+    const { headers, base } = getCreds_();
+    const issues = fetchIssuesByJQL_(base, headers, DEFAULT_JQL);
+    writeToSheet_(issues);
+    logHealth_(ENGINE, t0, 'OK', '');
+  } catch (e) {
+    logHealth_(ENGINE, t0, 'ERROR', e && e.message ? e.message : String(e));
+    throw e;
+  }
+}
+
+/*** Core helpers ***/
+function getCreds_() {
+  const props = PropertiesService.getScriptProperties();
+  const email = props.getProperty('JIRA_EMAIL');
+  const token = props.getProperty('JIRA_API_TOKEN');
+  if (!email || !token) throw new Error('Missing secrets. Run setSecrets() with your Jira email + API token.');
+  const auth = Utilities.base64Encode(email + ':' + token);
+  return {
+    headers: {
+      Authorization: 'Basic ' + auth,
+      Accept: 'application/json',
+      'Content-Type': 'application/json'
+    },
+    base: `https://${JIRA_SITE}/rest/api/3`
+  };
+}
+
+/**
+ * Robust Jira search with clean pagination & retries.
+ */
+function fetchIssuesByJQL_(base, headers, jql) {
+  const out = [];
+  let startAt = 0;
+  const pageSize = 100; // Jira caps at 100
+
+  while (true) {
+    const qs = [
+      `jql=${encodeURIComponent(jql)}`,
+      `startAt=${startAt}`,
+      `maxResults=${pageSize}`,
+      `fields=${encodeURIComponent(FIELDS.join(','))}`
+    ].join('&');
+
+    const url = `${base}/search?${qs}`;
+    const res = fetchWithRetry_(url, { method: 'get', headers, muteHttpExceptions: true });
+
+    if (res.getResponseCode() !== 200) {
+      const body = safeJson_(res.getContentText()) || {};
+      const details = [
+        ...(body.errorMessages || []),
+        ...Object.values(body.errors || {})
+      ].join(' | ');
+      throw new Error(`Jira search failed ${res.getResponseCode()}: ${details || res.getContentText()}`);
+    }
+
+    const body = JSON.parse(res.getContentText());
+    const issues = body.issues || [];
+    out.push(...issues);
+
+    const total   = typeof body.total === 'number' ? body.total : null;
+    const current = typeof body.startAt === 'number' ? body.startAt : startAt;
+    startAt = current + issues.length;
+
+    if (total !== null && startAt >= total) break;
+    if (issues.length === 0) break; // defensive
+  }
+
+  return out;
+}
+
+/**
+ * UrlFetch with exponential backoff and 429 support.
+ */
+function fetchWithRetry_(url, opts, maxAttempts = 5) {
+  let attempt = 0;
+  let waitMs = 500;
+  while (true) {
+    attempt++;
+    const res = UrlFetchApp.fetch(url, { followRedirects: true, validateHttpsCertificates: true, ...opts });
+    const code = res.getResponseCode();
+
+    // Success or non-retryable 4xx (except 429)
+    if ((code >= 200 && code < 300) || (code >= 400 && code < 500 && code !== 429)) {
+      return res;
+    }
+
+    // Retry on 429/5xx up to maxAttempts
+    if (attempt >= maxAttempts) return res;
+
+    let retryAfter = 0;
+    try {
+      const headers = res.getAllHeaders() || {};
+      retryAfter = Number(headers['Retry-After']) * 1000 || 0;
+    } catch (_) {}
+    Utilities.sleep(retryAfter || waitMs);
+    waitMs = Math.min(waitMs * 2, 8000);
+  }
+}
+
+/**
+ * Write issues to the "Tickets" sheet (recreates header, freezes row 1, sets formats).
+ */
+function writeToSheet_(issues) {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(TICKETS_TAB) || ss.insertSheet(TICKETS_TAB);
+
+  const header = [
+    'issueKey','projectKey','projectName','summary','description','issueType','status',
+    'assignee','assigneeEmail','priority','labels','components','fixVersions','versions',
+    'dueDate','created','updated','reporter','reporterEmail','resolution','resolutionDate',
+    'statusCategoryChanged','parentKey','url'
+  ];
+
+  sh.clearContents();
+  sh.getRange(1, 1, 1, header.length).setValues([header]);
+  sh.setFrozenRows(1);
+
+  const rows = issues.map(({ key, fields }) => {
+    const projKey  = safe(fields, ['project','key']);
+    const projName = safe(fields, ['project','name']);
+    const assignee = safe(fields, ['assignee','displayName']) || '';
+    const assEmail = safe(fields, ['assignee','emailAddress']) || '';
+    const reporter = safe(fields, ['reporter','displayName']) || '';
+    const repEmail = safe(fields, ['reporter','emailAddress']) || '';
+    const listNames = arr => Array.isArray(arr) ? arr.map(x => x && (x.name || x.key) || '').filter(Boolean).join(', ') : '';
+
+    // Flatten ADF description → plain text
+    const descriptionPlain = adfToText_(fields.description);
+
+    return [
+      key,
+      projKey || '',
+      projName || '',
+      fields.summary || '',
+      descriptionPlain || '',
+      safe(fields, ['issuetype','name']) || '',
+      safe(fields, ['status','name']) || '',
+      assignee,
+      assEmail,
+      safe(fields, ['priority','name']) || '',
+      Array.isArray(fields.labels) ? fields.labels.join(', ') : '',
+      listNames(fields.components),
+      listNames(fields.fixVersions),
+      listNames(fields.versions),
+      fields.duedate || '',
+      fields.created || '',
+      fields.updated || '',
+      reporter,
+      repEmail,
+      safe(fields, ['resolution','name']) || '',
+      fields.resolutiondate || '',
+      fields.statuscategorychangedate || '',
+      safe(fields, ['parent','key']) || '',
+      `https://${JIRA_SITE}/browse/${key}`
+    ];
+  });
+
+  if (rows.length) {
+    sh.getRange(2, 1, rows.length, header.length).setValues(rows);
+  }
+
+  // Friendly formats for date-like columns (1-based): due(15), created(16), updated(17), resolutionDate(22), statusCategoryChanged(23)
+  const dateCols = [15,16,17,22,23];
+  dateCols.forEach(c => sh.getRange(2, c, Math.max(rows.length, 1), 1).setNumberFormat('yyyy-mm-dd hh:mm'));
+
+  sh.autoResizeColumns(1, header.length);
+}
+
+/*** Health log ***/
+function logHealth_(engineName, t0, status, errorMsg) {
+  const runtime = ((new Date()) - t0) / 1000;
+  const ss = SpreadsheetApp.openById(HEALTH_SHEET_ID);
+  const sh = ss.getSheetByName(HEALTH_TAB_NAME) || ss.insertSheet(HEALTH_TAB_NAME);
+
+  // Ensure header exactly once (Engine Name | Timestamp | Status | Runtime | Error)
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(['Engine Name','Timestamp','Status','Runtime','Error']);
+  }
+
+  const normalizedStatus = String(status).toUpperCase() === 'OK' ? 'OK'
+                         : String(status).toUpperCase() === 'SUCCESS' ? 'OK'
+                         : String(status).toUpperCase() === 'ERROR' ? 'ERROR'
+                         : status;
+
+  const ts = new Date();
+  sh.appendRow([engineName, ts, normalizedStatus, runtime, errorMsg || '']);
+  // Optional: format timestamp column
+  sh.getRange(sh.getLastRow(), 2).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+}
+
+/*** tiny utils ***/
+function safe(obj, pathArr) {
+  return pathArr.reduce((acc, k) => (acc && k in acc ? acc[k] : undefined), obj);
+}
+function safeJson_(txt) { try { return JSON.parse(txt); } catch(_) { return null; } }
+
+/**
+ * Convert Jira Cloud ADF (rich text) description to plain text.
+ * Keeps paragraphs, bullets, numbers, quotes, headings, code, tables.
+ */
+function adfToText_(adf) {
+  if (!adf) return '';
+  try {
+    const parts = [];
+    const walk = (node) => {
+      if (!node) return;
+
+      const type = node.type;
+
+      // Text nodes
+      if (type === 'text') {
+        parts.push(node.text || '');
+        return;
+      }
+
+      // Inline hard break
+      if (type === 'hardBreak') {
+        parts.push('\n');
+        return;
+      }
+
+      // Paragraphs / headings
+      if (type === 'paragraph' || type === 'heading') {
+        if (Array.isArray(node.content)) node.content.forEach(walk);
+        parts.push('\n');
+        return;
+      }
+
+      // Bullet/ordered lists
+      if (type === 'bulletList' || type === 'orderedList') {
+        const isOrdered = type === 'orderedList';
+        let idx = (node.attrs && node.attrs.order) ? Number(node.attrs.order) : 1;
+        (node.content || []).forEach(li => {
+          const before = parts.length;
+          (li.content || []).forEach(walk);
+          let line = parts.splice(before).join('').trim();
+          if (line) {
+            const prefix = isOrdered ? `${idx}. ` : `• `;
+            parts.push(prefix + line + '\n');
+            idx++;
+          }
+        });
+        return;
+      }
+
+      // Blockquote
+      if (type === 'blockquote') {
+        const before = parts.length;
+        (node.content || []).forEach(walk);
+        let text = parts.splice(before).join('');
+        text = text.split('\n').map(s => s ? `> ${s}` : s).join('\n');
+        parts.push(text + '\n');
+        return;
+      }
+
+      // Code block
+      if (type === 'codeBlock') {
+        const before = parts.length;
+        (node.content || []).forEach(walk);
+        const codeText = parts.splice(before).join('');
+        parts.push(codeText + '\n');
+        return;
+      }
+
+      // Table (flatten)
+      if (type === 'table') {
+        (node.content || []).forEach(row => {
+          const cells = [];
+          (row.content || []).forEach(cell => {
+            const before = parts.length;
+            (cell.content || []).forEach(walk);
+            const cellText = parts.splice(before).join('').replace(/\n+/g, ' ').trim();
+            cells.push(cellText);
+          });
+          parts.push(cells.join(' | ') + '\n');
+        });
+        return;
+      }
+
+      // Fallback: walk children
+      if (Array.isArray(node.content)) node.content.forEach(walk);
+    };
+
+    if (adf.type === 'doc' && Array.isArray(adf.content)) {
+      adf.content.forEach(walk);
+    } else {
+      walk(adf);
+    }
+
+    return parts.join('').replace(/\n{3,}/g, '\n\n').trim();
+  } catch (e) {
+    return typeof adf === 'string' ? adf : JSON.stringify(adf);
+  }
+}
