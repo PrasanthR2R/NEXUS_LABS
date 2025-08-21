@@ -1,17 +1,19 @@
 /*******************************
- * NEXUS — JIRA TRACKER (Final + Teams, robust Sheets access)
- * - Pulls Jira issues (incl. description) to "Tickets"
- * - Logs run status to health log
- * - Sends Teams alerts (new, closed, daily summary)
- * - Uses explicit workbook ID + locking + retries to avoid timeouts
- *******************************/
+* NEXUS — JIRA TRACKER (Enhanced JQL, resilient)
+* - Pulls Jira issues (incl. description) to "Tickets"
+* - Rolling snapshot for diff (new/closed)
+* - Hourly alerts (new/closed) + Daily summary to Teams
+* - Health log with runtime + errors
+* - Robust retries, locking, explicit Sheet IDs
+* - Enhanced JQL search (/rest/api/3/search/jql) with GET→POST fallback
+*******************************/
 
-/*** CONFIG ***/
+/*** CONFIG (Project specifics) ***/
 // Jira
 const JIRA_SITE   = 'latcha.atlassian.net';
-const DEFAULT_JQL = 'statusCategory != Done ORDER BY updated DESC';
+const DEFAULT_JQL = 'statusCategory != Done ORDER BY updated DESC'; // closed detection handled via snapshot
 
-// Workbook (explicit ID to avoid getActive() timeouts)
+// Workbook (explicit ID to avoid getActive timeouts)
 const WORKBOOK_ID = '14ScwQOZ1jnbcsTJZ85_HWPVuOKNXMytc0Yuc2M9M1VQ';
 const TICKETS_TAB = 'Tickets';
 
@@ -19,16 +21,7 @@ const TICKETS_TAB = 'Tickets';
 const HEALTH_SHEET_ID = '18NPm8ZUkskHxTPqRrDrNTwlujlWDInJcHEVuPeJqSUg';
 const HEALTH_TAB_NAME = 'NEXUS_Engine_Health_Log';
 
-// Fields to fetch from Jira
-const FIELDS = [
-  'project','summary','description','issuetype','status','statuscategorychangedate','assignee',
-  'priority','labels','components','fixVersions','versions',
-  'duedate','created','updated','reporter','resolution','resolutiondate','parent'
-];
-
-// Teams (Incoming Webhook) — EXACT URL
-const TEAMS_WEBHOOK_URL = 'https://clictechnologies.webhook.office.com/webhookb2/d1d4f6f7-5378-4d2d-ba87-aedba03b3585@a4e69a77-1b2a-432a-b01b-19ce339290cc/IncomingWebhook/ce2aaaaa97d242049dad68d2e1510e4b/67cddb26-ab0c-4458-9ab3-9d33d615642b/V2SEg2b5gi7D5niMDk_-AB8vzLf_1E22jedqOwplyUFKU1';
-
+// Snapshot sheet
 const SNAPSHOT_SHEET = '_Snapshot'; // internal diff sheet
 
 // Fixed header (24 cols)
@@ -40,13 +33,30 @@ const TICKETS_HEADER = [
 ];
 const TICKETS_COLS = TICKETS_HEADER.length;
 
-/*** ONE-TIME: store Jira secrets, then remove literals ***/
+// Fields to fetch from Jira
+const FIELDS = [
+  'project','summary','description','issuetype','status','statuscategorychangedate','assignee',
+  'priority','labels','components','fixVersions','versions',
+  'duedate','created','updated','reporter','resolution','resolutiondate','parent'
+];
+
+// Description safety
+const MAX_DESC = 48000;
+
+/*** ONE-TIME: Save your secrets (then you can remove literals here) ***/
 function setSecrets() {
-  const JIRA_EMAIL = 'YOUR_JIRA_EMAIL@company.com';
-  const JIRA_API_TOKEN = 'YOUR_API_TOKEN_HERE';
-  if (!JIRA_EMAIL || !JIRA_API_TOKEN) throw new Error('Provide JIRA_EMAIL and JIRA_API_TOKEN.');
-  PropertiesService.getScriptProperties().setProperties({ JIRA_EMAIL, JIRA_API_TOKEN }, true);
-  Logger.log('Secrets saved.');
+  const JIRA_EMAIL      = 'indira.r@clictechnologies.com';
+  const JIRA_API_TOKEN  = 'ATATT3xFfGF0upwDVHwwbhNywY1nMk5eyBXNt5Ki3OxZRPdEuAJCfHyhx0bGTgc_i32shal_4s_LiQvZtqNq3QdeJnzbd7CKV0V03exWRtlelAc58WS8h5M4fLA44-fd8TSrS6Br6bYM9-WTzQdSGz--i1YZNwBlVY4-Q91X8i8q-QjG3CMkzgY=B6BABE45';
+  const TEAMS_WEBHOOK_URL = 'https://clictechnologies.webhook.office.com/webhookb2/d1d4f6f7-5378-4d2d-ba87-aedba03b3585@a4e69a77-1b2a-432a-b01b-19ce339290cc/IncomingWebhook/47c34d511b114f2d8611c9fe0d9de372/67cddb26-ab0c-4458-9ab3-9d33d615642b/V2FuUYnRVgvrnSJhdyjNXJRAXSidBRATGyHN_EtsveXrc1';
+
+  if (!JIRA_EMAIL || !JIRA_API_TOKEN || !TEAMS_WEBHOOK_URL) {
+    throw new Error('Provide JIRA_EMAIL, JIRA_API_TOKEN, and TEAMS_WEBHOOK_URL.');
+  }
+  PropertiesService.getScriptProperties().setProperties(
+    { JIRA_EMAIL, JIRA_API_TOKEN, TEAMS_WEBHOOK_URL },
+    true
+  );
+  Logger.log('Secrets saved to Script Properties.');
 }
 
 /*** MAIN: pull issues + write logs ***/
@@ -55,16 +65,17 @@ function Sync_Jira_Issues() {
   const ENGINE = 'Jira Tracker Engine';
   const lock = LockService.getScriptLock();
   try {
-    lock.waitLock(30000); // prevent overlap
+    lock.waitLock(30000);
     const { headers, base } = getCreds_();
     const issues = fetchIssuesByJQL_(base, headers, DEFAULT_JQL);
+    Logger.log(`[Sync] Fetched ${issues.length} issues from Jira.`);
     writeToSheet_(issues);
     logHealth_(ENGINE, t0, 'OK', '');
   } catch (e) {
     logHealth_(ENGINE, t0, 'ERROR', e && e.message ? e.message : String(e));
     throw e;
   } finally {
-    try { lock.releaseLock(); } catch(_) {}
+    try { lock.releaseLock(); } catch (_) {}
   }
 }
 
@@ -75,14 +86,14 @@ function Run_Hourly_Sync_And_Notifications() {
   const lock = LockService.getScriptLock();
   try {
     lock.waitLock(30000);
-    Sync_Jira_Issues();   // refresh the sheet first
-    detectAndNotify_();   // compare with snapshot + post Teams alerts
+    Sync_Jira_Issues();
+    detectAndNotify_();
     logHealth_(ENGINE, t0, 'OK', '');
   } catch (e) {
     logHealth_(ENGINE, t0, 'ERROR', e && e.message ? e.message : String(e));
     throw e;
   } finally {
-    try { lock.releaseLock(); } catch(_) {}
+    try { lock.releaseLock(); } catch (_) {}
   }
 }
 
@@ -92,9 +103,6 @@ function Send_Daily_Summary_To_Teams() {
   const ENGINE = 'Jira Daily Summary';
   try {
     const summary = buildDailySummary_();  // { totalCreated, totalClosed, openCount, extraText }
-    Logger.log('[Daily Summary Computed] ' + JSON.stringify(summary));
-
-    // Always send a card, even if all counts are zero
     const ok = postTeamsCard_({
       title: '📊 Daily Jira Summary',
       summary: 'Daily Jira Summary',
@@ -108,9 +116,7 @@ function Send_Daily_Summary_To_Teams() {
       text: summary.extraText || '_No extra notes for today._',
       button: { name: 'Open Tickets Sheet', uri: getWorkbook_().getUrl() }
     });
-
-    if (!ok) throw new Error('Teams webhook did not accept Daily Summary (see health log for details).');
-
+    if (!ok) throw new Error('Teams webhook did not accept Daily Summary (see health log).');
     logHealth_(ENGINE, t0, 'OK', '');
   } catch (e) {
     logHealth_(ENGINE, t0, 'ERROR', e && e.message ? e.message : String(e));
@@ -135,44 +141,91 @@ function getCreds_() {
   };
 }
 
-/** Robust Jira search with pagination & retries */
+function getTeamsWebhook_() {
+  const url = PropertiesService.getScriptProperties().getProperty('TEAMS_WEBHOOK_URL');
+  if (!url) throw new Error('Missing TEAMS_WEBHOOK_URL in Script Properties. Run setSecrets().');
+  return url;
+}
+
+/** Enhanced JQL search with GET→POST fallback + nextPageToken pagination */
 function fetchIssuesByJQL_(base, headers, jql) {
-  const out = [];
-  let startAt = 0;
-  const pageSize = 100;
+  const all = [];
+  let token = null;
 
-  while (true) {
-    const qs = [
-      `jql=${encodeURIComponent(jql)}`,
-      `startAt=${startAt}`,
-      `maxResults=${pageSize}`,
-      `fields=${encodeURIComponent(FIELDS.join(','))}`
-    ].join('&');
+  // First try GET (most tenants support it)
+  try {
+    while (true) {
+      const params = [
+        `jql=${encodeURIComponent(jql)}`,
+        `maxResults=100`,
+        token ? `nextPageToken=${encodeURIComponent(token)}` : null,
+        `fields=${encodeURIComponent(FIELDS.join(','))}`
+      ].filter(Boolean).join('&');
 
-    const url = `${base}/search?${qs}`;
-    const res = fetchWithRetry_(url, { method: 'get', headers, muteHttpExceptions: true });
+      const url = `${base}/search/jql?${params}`;
+      const res = fetchWithRetry_(url, { method: 'get', headers, muteHttpExceptions: true });
+      const code = res.getResponseCode();
 
-    if (res.getResponseCode() !== 200) {
+      // If GET is not supported/behaving oddly, bail to POST fallback
+      if (code === 404 || code === 410 || code === 405 || code === 400) {
+        Logger.log(`[Enhanced JQL] GET fallback trigger code=${code}. Switching to POST.`);
+        throw new Error('GET not supported, switching to POST.');
+      }
+
+      if (code !== 200) {
+        const bodyTxt = res.getContentText();
+        throw new Error(`GET /search/jql failed ${code}: ${bodyTxt}`);
+      }
+
       const body = safeJson_(res.getContentText()) || {};
-      const details = [
-        ...(body.errorMessages || []),
-        ...Object.values(body.errors || {})
-      ].join(' | ');
-      throw new Error(`Jira search failed ${res.getResponseCode()}: ${details || res.getContentText()}`);
+      const issues = body.issues || [];
+      all.push(...issues);
+
+      token = body.nextPageToken || null;
+      if (!token || issues.length === 0) break;
     }
 
-    const body = JSON.parse(res.getContentText());
-    const issues = body.issues || [];
-    out.push(...issues);
+    Logger.log(`[Enhanced JQL][GET] Retrieved ${all.length} issues total.`);
+    return all;
 
-    const total   = typeof body.total === 'number' ? body.total : null;
-    const current = typeof body.startAt === 'number' ? body.startAt : startAt;
-    startAt = current + issues.length;
+  } catch (e) {
+    // POST fallback path — some sites prefer POST body for Enhanced JQL
+    Logger.log(`[Enhanced JQL] Falling back to POST due to: ${e && e.message ? e.message : e}`);
+    token = null;
+    while (true) {
+      const payload = {
+        jql: jql,
+        fields: FIELDS,     // array OK for POST
+        maxResults: 100
+      };
+      if (token) payload.nextPageToken = token;
 
-    if (total !== null && startAt >= total) break;
-    if (issues.length === 0) break;
+      const url = `${base}/search/jql`;
+      const res = fetchWithRetry_(url, {
+        method: 'post',
+        contentType: 'application/json; charset=utf-8',
+        payload: JSON.stringify(payload),
+        headers,
+        muteHttpExceptions: true
+      });
+
+      const code = res.getResponseCode();
+      if (code !== 200) {
+        const txt = res.getContentText();
+        throw new Error(`POST /search/jql failed ${code}: ${txt}`);
+      }
+
+      const body = safeJson_(res.getContentText()) || {};
+      const issues = body.issues || [];
+      all.push(...issues);
+
+      token = body.nextPageToken || null;
+      if (!token || issues.length === 0) break;
+    }
+
+    Logger.log(`[Enhanced JQL][POST] Retrieved ${all.length} issues total.`);
+    return all;
   }
-  return out;
 }
 
 /** UrlFetch with exponential backoff and 429 support */
@@ -184,6 +237,7 @@ function fetchWithRetry_(url, opts, maxAttempts = 5) {
     const res = UrlFetchApp.fetch(url, { followRedirects: true, validateHttpsCertificates: true, ...opts });
     const code = res.getResponseCode();
     if ((code >= 200 && code < 300) || (code >= 400 && code < 500 && code !== 429)) return res;
+
     if (attempt >= maxAttempts) return res;
 
     let retryAfter = 0;
@@ -194,9 +248,7 @@ function fetchWithRetry_(url, opts, maxAttempts = 5) {
 }
 
 /** Workbook + Sheet helpers with retries */
-function getWorkbook_() {
-  return withRetry_(() => SpreadsheetApp.openById(WORKBOOK_ID));
-}
+function getWorkbook_() { return withRetry_(() => SpreadsheetApp.openById(WORKBOOK_ID)); }
 function getSheet_(name) {
   return withRetry_(() => {
     const ss = getWorkbook_();
@@ -209,9 +261,8 @@ function withRetry_(fn, max = 5, initialWait = 400) {
   let attempt = 0, wait = initialWait;
   while (true) {
     attempt++;
-    try {
-      return fn();
-    } catch (e) {
+    try { return fn(); }
+    catch (e) {
       if (attempt >= max) throw e;
       Utilities.sleep(wait);
       wait = Math.min(wait * 2, 6000);
@@ -219,10 +270,9 @@ function withRetry_(fn, max = 5, initialWait = 400) {
   }
 }
 
-/** Write issues to "Tickets" (recreates header, freezes row 1, formats dates) */
+/** Write issues to "Tickets" */
 function writeToSheet_(issues) {
   const sh = getSheet_(TICKETS_TAB);
-
   sh.clearContents();
   sh.getRange(1, 1, 1, TICKETS_COLS).setValues([TICKETS_HEADER]);
   sh.setFrozenRows(1);
@@ -234,15 +284,19 @@ function writeToSheet_(issues) {
     const assEmail = safe(fields, ['assignee','emailAddress']) || '';
     const reporter = safe(fields, ['reporter','displayName']) || '';
     const repEmail = safe(fields, ['reporter','emailAddress']) || '';
-    const listNames = arr => Array.isArray(arr) ? arr.map(x => x && (x.name || x.key) || '').filter(Boolean).join(', ') : '';
-    const descriptionPlain = adfToText_(fields.description);
+    const listNames = arr => Array.isArray(arr) ? arr.map(x => (x && (x.name || x.key) || '')).filter(Boolean).join(', ') : '';
+
+    const descPlain = (adfToText_(fields.description) || '');
+    const descriptionCell = descPlain.length > MAX_DESC
+      ? descPlain.substring(0, MAX_DESC - 12) + '\n[…truncated]'
+      : descPlain;
 
     return [
       key,
       projKey || '',
       projName || '',
       fields.summary || '',
-      descriptionPlain || '',
+      descriptionCell || '',
       safe(fields, ['issuetype','name']) || '',
       safe(fields, ['status','name']) || '',
       assignee,
@@ -296,12 +350,43 @@ function logHealth_(engineName, t0, status, errorMsg) {
 }
 
 /*** tiny utils ***/
-function safe(obj, pathArr) {
-  return pathArr.reduce((acc, k) => (acc && k in acc ? acc[k] : undefined), obj);
-}
+function safe(obj, pathArr) { return pathArr.reduce((acc, k) => (acc && k in acc ? acc[k] : undefined), obj); }
 function safeJson_(txt) { try { return JSON.parse(txt); } catch(_) { return null; } }
+function formatDate_(d, fmt) { return Utilities.formatDate(d, Session.getScriptTimeZone(), fmt); }
+function escapeMd_(s){ return String(s||'').replace(/(\*|_|\`|\[|\])/g,'\\$1'); }
+function toIso_(v) {
+  if (!v) return '';
+  try {
+    if (v instanceof Date) return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd\'T\'HH:mm:ss');
+    const s = String(v);
+    const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] + 'T' + (s.split('T')[1] || '00:00:00') : s;
+  } catch(_) { return String(v); }
+}
+function toIsoDateOnly_(v) {
+  if (!v) return '';
+  try {
+    if (v instanceof Date) return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    const s = String(v); const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] : s;
+  } catch(_) { return String(v); }
+}
+function priorityIcon_(p) {
+  const s = String(p||'').toLowerCase();
+  if (!s) return '';
+  if (s.includes('critical') || s.includes('blocker') || s.includes('p0')) return '🚨';
+  if (s.includes('high') || s.includes('p1') || s.includes('urgent')) return '🔥';
+  if (s.includes('medium') || s.includes('p2')) return '⚠️';
+  if (s.includes('low') || s.includes('p3') || s.includes('p4')) return '🐢';
+  return '';
+}
+function toBoolDone_(status) {
+  if (!status) return false;
+  const s = status.toLowerCase();
+  return ['done','closed','resolved','complete'].some(k => s.includes(k));
+}
 
-/** Convert Jira Cloud ADF (rich text) description to plain text. */
+/** Convert Jira Cloud ADF (rich text) description to plain text (with link handling). */
 function adfToText_(adf) {
   if (!adf) return '';
   try {
@@ -310,7 +395,20 @@ function adfToText_(adf) {
       if (!node) return;
       const type = node.type;
 
-      if (type === 'text') { parts.push(node.text || ''); return; }
+      // inline text; detect links in marks
+      if (type === 'text') {
+        let text = node.text || '';
+        if (node.marks && node.marks.length) {
+          const link = node.marks.find(m => m.type === 'link' && m.attrs && m.attrs.href);
+          if (link) { parts.push(`${text} (${link.attrs.href})`); return; }
+          const strong = node.marks.some(m => m.type === 'strong'); if (strong) text = `**${text}**`;
+          const em     = node.marks.some(m => m.type === 'em');     if (em)     text = `_${text}_`;
+          const code   = node.marks.some(m => m.type === 'code');   if (code)   text = '`' + text + '`';
+        }
+        parts.push(text);
+        return;
+      }
+
       if (type === 'hardBreak') { parts.push('\n'); return; }
 
       if (type === 'paragraph' || type === 'heading') {
@@ -364,6 +462,7 @@ function adfToText_(adf) {
 
     if (adf.type === 'doc' && Array.isArray(adf.content)) adf.content.forEach(walk);
     else walk(adf);
+
     return parts.join('').replace(/\n{3,}/g, '\n\n').trim();
   } catch (e) {
     return typeof adf === 'string' ? adf : JSON.stringify(adf);
@@ -374,7 +473,6 @@ function adfToText_(adf) {
    TEAMS INTEGRATION (hourly new/closed alerts + daily summary)
 -------------------------------------------------------------------*/
 
-// Quick trigger helpers
 function createHourlyTrigger_() {
   deleteTriggersByFunc_('Run_Hourly_Sync_And_Notifications');
   ScriptApp.newTrigger('Run_Hourly_Sync_And_Notifications').timeBased().everyHours(1).create();
@@ -382,8 +480,8 @@ function createHourlyTrigger_() {
 }
 function createDailySummaryTrigger_() {
   deleteTriggersByFunc_('Send_Daily_Summary_To_Teams');
-  ScriptApp.newTrigger('Send_Daily_Summary_To_Teams').timeBased().atHour(18).everyDays(1).create(); // 18:00 local
-  Logger.log('Created daily summary trigger for 18:00 local time');
+  ScriptApp.newTrigger('Send_Daily_Summary_To_Teams').timeBased().atHour(18).everyDays(1).create(); // 18:00 script TZ
+  Logger.log('Created daily summary trigger for 18:00');
 }
 function deleteTriggersByFunc_(funcName) {
   ScriptApp.getProjectTriggers().forEach(tr => {
@@ -391,14 +489,14 @@ function deleteTriggersByFunc_(funcName) {
   });
 }
 
-// Optional: initialize snapshot immediately
+/** Initialize snapshot immediately (optional) */
 function Initialize_Jira_Snapshot() {
   const current = loadCurrentTickets_(); // may be empty on first run
   saveSnapshot_(current);
   Logger.log('Snapshot initialized with ' + Object.keys(current).length + ' items.');
 }
 
-// Detect changes vs last snapshot and notify Teams
+/** Detect changes vs last snapshot and notify Teams */
 function detectAndNotify_() {
   const current = loadCurrentTickets_(); // map by issueKey
   const snap    = loadSnapshot_();       // map by issueKey
@@ -406,6 +504,7 @@ function detectAndNotify_() {
   const newIssues = [];
   const closedIssues = [];
 
+  // New/closed where present in current
   Object.keys(current).forEach(key => {
     const cur = current[key];
     const prev = snap[key];
@@ -423,13 +522,30 @@ function detectAndNotify_() {
     }
   });
 
-  newIssues.forEach(issue => notifyNewIssue_(issue));
-  closedIssues.forEach(issue => notifyClosedIssue_(issue));
+  // Closed: present before, missing now (because JQL excludes Done)
+  Object.keys(snap).forEach(key => {
+    if (!current[key]) {
+      const prev = snap[key];
+      if (!toBoolDone_(prev.status)) {
+        closedIssues.push({
+          issueKey: key,
+          projectKey: prev.projectKey || '',
+          status: 'Done',
+          resolution: prev.resolution || '',
+          resolutionDate: prev.resolutionDate || '',
+          summary: prev.summary || '(summary not captured yet)',
+          url: prev.url || `https://${JIRA_SITE}/browse/${key}`
+        });
+      }
+    }
+  });
 
+  newIssues.forEach(notifyNewIssue_);
+  closedIssues.forEach(notifyClosedIssue_);
   saveSnapshot_(current);
 }
 
-// Sheet helpers for diffing
+/** Sheet helpers for diffing */
 function loadCurrentTickets_() {
   const sh = getSheet_(TICKETS_TAB);
   const lastRow = sh.getLastRow();
@@ -467,19 +583,29 @@ function loadSnapshot_() {
   const sh = getSheet_(SNAPSHOT_SHEET);
   const last = sh.getLastRow();
   if (last < 2) return {};
-  const values = sh.getRange(2, 1, last - 1, 8).getValues();
+  const header = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const values = sh.getRange(2, 1, last - 1, sh.getLastColumn()).getValues();
+
+  const idx = (name) => header.indexOf(name);
+  // Back-compat support (old 8-col snapshot)
+  const hasRich = idx('summary') !== -1 && idx('projectKey') !== -1 && idx('url') !== -1;
+
   const map = {};
   values.forEach(r => {
-    const key = String(r[0]||'').trim();
+    const key = String(r[0]||'').trim(); // issueKey
     if (!key) return;
     map[key] = {
-      status: String(r[1]||''),
-      resolution: String(r[2]||''),
-      resolutionDate: String(r[3]||''),
-      updated: String(r[4]||''),
-      priority: String(r[5]||''),
-      assignee: String(r[6]||''),
-      dueDate: String(r[7]||'')
+      issueKey: key,
+      status: String(r[hasRich ? idx('status') : 1]||''),
+      resolution: String(r[hasRich ? idx('resolution') : 2]||''),
+      resolutionDate: String(r[hasRich ? idx('resolutionDate') : 3]||''),
+      updated: String(r[hasRich ? idx('updated') : 4]||''),
+      priority: String(r[hasRich ? idx('priority') : 5]||''),
+      assignee: String(r[hasRich ? idx('assignee') : 6]||''),
+      dueDate: String(r[hasRich ? idx('dueDate') : 7]||''),
+      summary: hasRich ? String(r[idx('summary')]||'') : '',
+      projectKey: hasRich ? String(r[idx('projectKey')]||'') : '',
+      url: hasRich ? String(r[idx('url')]||'') : ''
     };
   });
   return map;
@@ -488,23 +614,26 @@ function loadSnapshot_() {
 function saveSnapshot_(currentMap) {
   const sh = getSheet_(SNAPSHOT_SHEET);
   sh.clearContents();
-  sh.getRange(1, 1, 1, 8).setValues([['issueKey','status','resolution','resolutionDate','updated','priority','assignee','dueDate']]);
+  const header = [
+    'issueKey','status','resolution','resolutionDate','updated','priority','assignee','dueDate',
+    'summary','projectKey','url'
+  ];
+  sh.getRange(1, 1, 1, header.length).setValues([header]);
+
   const rows = Object.keys(currentMap).map(k => {
     const it = currentMap[k];
-    return [k, it.status, it.resolution, it.resolutionDate || '', it.updated || '', it.priority || '', it.assignee || '', it.dueDate || '' ];
+    return [
+      k, it.status || '', it.resolution || '', it.resolutionDate || '', it.updated || '',
+      it.priority || '', it.assignee || '', it.dueDate || '',
+      it.summary || '', it.projectKey || '', it.url || `https://${JIRA_SITE}/browse/${k}`
+    ];
   });
-  if (rows.length) sh.getRange(2, 1, rows.length, 8).setValues(rows);
-  // sh.hideSheet(); // optional
+
+  if (rows.length) sh.getRange(2, 1, rows.length, header.length).setValues(rows);
+  sh.getRange(1, header.length + 1).setNote('Snapshot updated: ' + new Date().toString());
 }
 
-// Status helper
-function toBoolDone_(status) {
-  if (!status) return false;
-  const s = status.toLowerCase();
-  return ['done','closed','resolved','complete'].some(k => s.includes(k));
-}
-
-// Teams notifications
+/** Teams notifications */
 function notifyNewIssue_(it) {
   const priorityEmoji = priorityIcon_(it.priority);
   const headline = (it.projectKey === 'MAX')
@@ -547,16 +676,13 @@ function notifyClosedIssue_(it) {
   });
 }
 
-/** Robust Teams post: retries + logs + body check. Returns true on success ("1"). */
+/** Robust Teams post: retries + logs + body check. Returns true on success ("1" or empty). */
 function postTeamsCard_({ title, summary, themeColor, activityTitle, facts = [], text = '', button }) {
-  if (!TEAMS_WEBHOOK_URL) {
-    logHealth_('Teams Notify', new Date(), 'ERROR', 'Missing TEAMS_WEBHOOK_URL');
-    return false;
-  }
+  const TEAMS_WEBHOOK_URL = getTeamsWebhook_();
 
   const payload = {
     '@type': 'MessageCard',
-    '@context': 'http://schema.org/extensions', // per Microsoft examples
+    '@context': 'http://schema.org/extensions',
     summary: summary || title,
     themeColor: themeColor || '0078D4',
     title,
@@ -590,10 +716,7 @@ function postTeamsCard_({ title, summary, themeColor, activityTitle, facts = [],
       const code = res.getResponseCode();
       const txt = (res.getContentText() || '').trim();
 
-      // Success criteria: HTTP 2xx AND body empty or "1"
       const success = (code >= 200 && code < 300) && (txt === '' || txt === '1');
-
-      // Teams sometimes embeds errors in body as 200 responses; detect common pattern
       const bodyHasError = /Microsoft Teams endpoint returned HTTP error|Bad payload/i.test(txt);
 
       if (success && !bodyHasError) return true;
@@ -611,11 +734,11 @@ function postTeamsCard_({ title, summary, themeColor, activityTitle, facts = [],
   }
 }
 
-/** Minimal text ping to verify the webhook path. Logs code + body. */
+/** Quick text ping + test card */
 function Send_Teams_Text_Ping() {
-  if (!TEAMS_WEBHOOK_URL) throw new Error('Missing TEAMS_WEBHOOK_URL');
+  const url = getTeamsWebhook_();
   const payload = { text: 'Ping from Apps Script ' + new Date().toISOString() };
-  const res = UrlFetchApp.fetch(TEAMS_WEBHOOK_URL, {
+  const res = UrlFetchApp.fetch(url, {
     method: 'post',
     contentType: 'application/json; charset=utf-8',
     payload: JSON.stringify(payload),
@@ -625,14 +748,20 @@ function Send_Teams_Text_Ping() {
   });
   Logger.log(`Ping -> code=${res.getResponseCode()} body="${res.getContentText()}"`);
 }
-
-/** Quick end-to-end webhook validation: text ping + message card. */
-function Validate_Teams_Webhook_() {
-  Send_Teams_Text_Ping();
-  Send_Teams_Test_Card();
+function Send_Teams_Test_Card() {
+  const ok = postTeamsCard_({
+    title: '✅ Teams Webhook Test',
+    summary: 'Test',
+    themeColor: '2EB886',
+    activityTitle: '**Test card from Apps Script**',
+    facts: [{ name: 'When', value: new Date().toString() }],
+    text: 'If you see this, the webhook is healthy.',
+    button: { name: 'Open Tickets Sheet', uri: getWorkbook_().getUrl() }
+  });
+  if (!ok) Logger.log('Test card failed to post. Check health log for Teams Notify errors.');
 }
 
-// Daily summary builder
+/** Daily summary builder */
 function buildDailySummary_() {
   const sh = getSheet_(TICKETS_TAB);
   const last = sh.getLastRow();
@@ -675,55 +804,18 @@ function buildDailySummary_() {
   return { totalCreated, totalClosed, openCount, extraText: extra };
 }
 
-// Small utils
-function toIso_(v) {
-  if (!v) return '';
-  try {
-    if (v instanceof Date) return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd\'T\'HH:mm:ss');
-    const s = String(v);
-    const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
-    return m ? m[1] + 'T' + (s.split('T')[1] || '00:00:00') : s;
-  } catch(_) { return String(v); }
-}
-function toIsoDateOnly_(v) {
-  if (!v) return '';
-  try {
-    if (v instanceof Date) return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd');
-    const s = String(v); const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
-    return m ? m[1] : s;
-  } catch(_) { return String(v); }
-}
-function formatDate_(d, fmt) {
-  return Utilities.formatDate(d, Session.getScriptTimeZone(), fmt);
-}
-function escapeMd_(s){ return String(s||'').replace(/(\*|_|\`|\[|\])/g,'\\$1'); }
-function priorityIcon_(p) {
-  const s = String(p||'').toLowerCase();
-  if (!s) return '';
-  if (s.includes('critical') || s.includes('blocker') || s.includes('p0')) return '🚨';
-  if (s.includes('high') || s.includes('p1') || s.includes('urgent')) return '🔥';
-  if (s.includes('medium') || s.includes('p2')) return '⚠️';
-  if (s.includes('low') || s.includes('p3') || s.includes('p4')) return '🐢';
-  return '';
-}
-
 /* ---------------------------
    DEBUG / DIAGNOSTIC HELPERS
 ----------------------------*/
-function Send_Teams_Test_Card() {
-  const ok = postTeamsCard_({
-    title: '✅ Teams Webhook Test',
-    summary: 'Test',
-    themeColor: '2EB886',
-    activityTitle: '**Test card from Apps Script**',
-    facts: [{ name: 'When', value: new Date().toString() }],
-    text: 'If you see this, the webhook is healthy.',
-    button: { name: 'Open Tickets Sheet', uri: getWorkbook_().getUrl() }
-  });
-  if (!ok) Logger.log('Test card failed to post. Check health log for Teams Notify errors.');
-}
-
 function Debug_Daily_Summary() {
   const s = buildDailySummary_();
   Logger.log(JSON.stringify(s, null, 2));
 }
+
+/* ---------------------------
+   Back-compat alias functions
+----------------------------*/
+// Fixes ReferenceError if old trigger/function names are used
+function _notifyNewIssue_(it){ return notifyNewIssue_(it); }
+function _notifyClosedIssue_(it){ return notifyClosedIssue_(it); }
+function Hourly_Check_And_Notify(){ return Run_Hourly_Sync_And_Notifications(); }
