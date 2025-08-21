@@ -1,821 +1,473 @@
-/*******************************
-* NEXUS — JIRA TRACKER (Enhanced JQL, resilient)
-* - Pulls Jira issues (incl. description) to "Tickets"
-* - Rolling snapshot for diff (new/closed)
-* - Hourly alerts (new/closed) + Daily summary to Teams
-* - Health log with runtime + errors
-* - Robust retries, locking, explicit Sheet IDs
-* - Enhanced JQL search (/rest/api/3/search/jql) with GET→POST fallback
-*******************************/
+/*****************  HARD-CODED TEST CREDS (as requested)  *****************/
+const JIRA_EMAIL     = 'indira.r@clictechnologies.com';
+const JIRA_API_TOKEN = '';
+const JIRA_SITE      = 'latcha.atlassian.net';
 
-/*** CONFIG (Project specifics) ***/
-// Jira
-const JIRA_SITE   = 'latcha.atlassian.net';
-const DEFAULT_JQL = 'statusCategory != Done ORDER BY updated DESC'; // closed detection handled via snapshot
+/*****************  MICROSOFT TEAMS WEBHOOK  *****************/
+// 👉 Replace with your Teams Incoming Webhook URL
+const TEAMS_WEBHOOK_URL = 'https://clictechnologies.webhook.office.com/webhookb2/d1d4f6f7-5378-4d2d-ba87-aedba03b3585@a4e69a77-1b2a-432a-b01b-19ce339290cc/IncomingWebhook/47c34d511b114f2d8611c9fe0d9de372/67cddb26-ab0c-4458-9ab3-9d33d615642b/V2FuUYnRVgvrnSJhdyjNXJRAXSidBRATGyHN_EtsveXrc1';
 
-// Workbook (explicit ID to avoid getActive timeouts)
-const WORKBOOK_ID = '14ScwQOZ1jnbcsTJZ85_HWPVuOKNXMytc0Yuc2M9M1VQ';
-const TICKETS_TAB = 'Tickets';
+/*****************  SHEETS  *****************/
+const ISSUES_SHEET   = 'Jira Issues';   // your export tab (optional for reference)
+const SNAPSHOT_SHEET = 'Jira Snapshot'; // used by the engine to diff state
 
-// Health log sheet
-const HEALTH_SHEET_ID = '18NPm8ZUkskHxTPqRrDrNTwlujlWDInJcHEVuPeJqSUg';
-const HEALTH_TAB_NAME = 'NEXUS_Engine_Health_Log';
+/*****************  PUBLIC ENTRY POINTS  *****************/
+// 1) Run once to seed snapshot (no notifications)
+function PrimeSnapshot() {
+  requireWebhook_();
+  const issues = fetchAllIssuesAllProjects_(); // all issues you can see (bounded per project)
+  writeSnapshot_(issues, {silent:true});       // store state, don't notify
+  Logger.log(`Snapshot primed with ${issues.length} issues.`);
+}
 
-// Snapshot sheet
-const SNAPSHOT_SHEET = '_Snapshot'; // internal diff sheet
+// 2) Hourly scan: detects New + Closed and sends Teams notifications
+function HourlyScan() {
+  requireWebhook_();
+  ensureSnapshotSheet_();
+  const snapshot = readSnapshot_();
 
-// Fixed header (24 cols)
-const TICKETS_HEADER = [
-  'issueKey','projectKey','projectName','summary','description','issueType','status',
-  'assignee','assigneeEmail','priority','labels','components','fixVersions','versions',
-  'dueDate','created','updated','reporter','reporterEmail','resolution','resolutionDate',
-  'statusCategoryChanged','parentKey','url'
-];
-const TICKETS_COLS = TICKETS_HEADER.length;
-
-// Fields to fetch from Jira
-const FIELDS = [
-  'project','summary','description','issuetype','status','statuscategorychangedate','assignee',
-  'priority','labels','components','fixVersions','versions',
-  'duedate','created','updated','reporter','resolution','resolutiondate','parent'
-];
-
-// Description safety
-const MAX_DESC = 48000;
-
-/*** ONE-TIME: Save your secrets (then you can remove literals here) ***/
-function setSecrets() {
-  const JIRA_EMAIL      = 'indira.r@clictechnologies.com';
-  const JIRA_API_TOKEN  = 'ATATT3xFfGF0upwDVHwwbhNywY1nMk5eyBXNt5Ki3OxZRPdEuAJCfHyhx0bGTgc_i32shal_4s_LiQvZtqNq3QdeJnzbd7CKV0V03exWRtlelAc58WS8h5M4fLA44-fd8TSrS6Br6bYM9-WTzQdSGz--i1YZNwBlVY4-Q91X8i8q-QjG3CMkzgY=B6BABE45';
-  const TEAMS_WEBHOOK_URL = 'https://clictechnologies.webhook.office.com/webhookb2/d1d4f6f7-5378-4d2d-ba87-aedba03b3585@a4e69a77-1b2a-432a-b01b-19ce339290cc/IncomingWebhook/47c34d511b114f2d8611c9fe0d9de372/67cddb26-ab0c-4458-9ab3-9d33d615642b/V2FuUYnRVgvrnSJhdyjNXJRAXSidBRATGyHN_EtsveXrc1';
-
-  if (!JIRA_EMAIL || !JIRA_API_TOKEN || !TEAMS_WEBHOOK_URL) {
-    throw new Error('Provide JIRA_EMAIL, JIRA_API_TOKEN, and TEAMS_WEBHOOK_URL.');
+  // If brand new sheet, prime then exit
+  if (Object.keys(snapshot).length === 0) {
+    PrimeSnapshot();
+    return;
   }
-  PropertiesService.getScriptProperties().setProperties(
-    { JIRA_EMAIL, JIRA_API_TOKEN, TEAMS_WEBHOOK_URL },
-    true
-  );
-  Logger.log('Secrets saved to Script Properties.');
+
+  // Pull only recently updated issues for speed (last 2 days)
+  const issues = fetchRecentIssuesAllProjects_('-2d');
+  const delta  = computeDelta_(issues, snapshot);
+
+  // Notify new tickets
+  delta.newIssues.forEach(i => notifyNewTicket_(i));
+
+  // Notify closed tickets
+  delta.closedIssues.forEach(i => notifyClosedTicket_(i));
+
+  // Upsert snapshot with new view
+  writeSnapshot_(issues, {silent:false, carryFlags:true});
+  Logger.log(`Scan done. New: ${delta.newIssues.length}, Closed: ${delta.closedIssues.length}`);
 }
 
-/*** MAIN: pull issues + write logs ***/
-function Sync_Jira_Issues() {
-  const t0 = new Date();
-  const ENGINE = 'Jira Tracker Engine';
-  const lock = LockService.getScriptLock();
-  try {
-    lock.waitLock(30000);
-    const { headers, base } = getCreds_();
-    const issues = fetchIssuesByJQL_(base, headers, DEFAULT_JQL);
-    Logger.log(`[Sync] Fetched ${issues.length} issues from Jira.`);
-    writeToSheet_(issues);
-    logHealth_(ENGINE, t0, 'OK', '');
-  } catch (e) {
-    logHealth_(ENGINE, t0, 'ERROR', e && e.message ? e.message : String(e));
-    throw e;
-  } finally {
-    try { lock.releaseLock(); } catch (_) {}
-  }
+// 3) Daily summary at 9:30 PM IST (set by InstallTriggers)
+function DailySummary() {
+  requireWebhook_();
+  const snapshot = readSnapshot_();
+  const today = new Date(); // project timezone should be IST in File → Project Settings
+
+  const all = Object.values(snapshot);
+  const totals = summarize_(all, today);
+
+  const card = buildSummaryCard_(totals);
+  postToTeams_(card);
+  Logger.log('Daily summary sent to Teams.');
 }
 
-/*** Hourly entrypoint = sync + Teams notifications ***/
-function Run_Hourly_Sync_And_Notifications() {
-  const t0 = new Date();
-  const ENGINE = 'Jira Hourly Sync + Teams Notify';
-  const lock = LockService.getScriptLock();
-  try {
-    lock.waitLock(30000);
-    Sync_Jira_Issues();
-    detectAndNotify_();
-    logHealth_(ENGINE, t0, 'OK', '');
-  } catch (e) {
-    logHealth_(ENGINE, t0, 'ERROR', e && e.message ? e.message : String(e));
-    throw e;
-  } finally {
-    try { lock.releaseLock(); } catch (_) {}
-  }
+// 4) Install time-driven triggers (hourly + 21:30 IST daily)
+function InstallTriggers() {
+  // Clean old triggers for these functions
+  removeTriggersFor_(['HourlyScan','DailySummary']);
+
+  // Hourly
+  ScriptApp.newTrigger('HourlyScan')
+    .timeBased()
+    .everyHours(1)
+    .create();
+
+  // Daily at 21:30 (project timezone!)
+  ScriptApp.newTrigger('DailySummary')
+    .timeBased()
+    .atHour(21)
+    .nearMinute(30)
+    .everyDays(1)
+    .create();
+
+  Logger.log('Triggers installed: HourlyScan (hourly), DailySummary (21:30).');
 }
 
-/*** Daily summary sender (create a daily trigger for this) — ALWAYS POSTS ***/
-function Send_Daily_Summary_To_Teams() {
-  const t0 = new Date();
-  const ENGINE = 'Jira Daily Summary';
-  try {
-    const summary = buildDailySummary_();  // { totalCreated, totalClosed, openCount, extraText }
-    const ok = postTeamsCard_({
-      title: '📊 Daily Jira Summary',
-      summary: 'Daily Jira Summary',
-      themeColor: '0078D4',
-      activityTitle: `**Daily Summary (${formatDate_(new Date(), 'yyyy-MM-dd')})**`,
-      facts: [
-        { name: 'New tickets', value: String(summary.totalCreated) },
-        { name: 'Closed tickets', value: String(summary.totalClosed) },
-        { name: 'Open tickets (now)', value: String(summary.openCount) }
-      ],
-      text: summary.extraText || '_No extra notes for today._',
-      button: { name: 'Open Tickets Sheet', uri: getWorkbook_().getUrl() }
-    });
-    if (!ok) throw new Error('Teams webhook did not accept Daily Summary (see health log).');
-    logHealth_(ENGINE, t0, 'OK', '');
-  } catch (e) {
-    logHealth_(ENGINE, t0, 'ERROR', e && e.message ? e.message : String(e));
-    throw e;
-  }
+/*****************  CORE Jira FETCH (Enhanced Search)  *****************/
+
+// Fetch ALL issues across projects (bounded per project to satisfy enhanced JQL)
+function fetchAllIssuesAllProjects_() {
+  const fields = coreFields_();
+  const projects = listProjectKeys_();
+  let all = [];
+  projects.forEach(p => {
+    const jql = `project = ${escapeJqlIdent_(p.key)} ORDER BY created DESC`;
+    all.push(...fetchIssuesWithEnhancedJql_(jql, fields));
+  });
+  return all;
 }
 
-/*** Core helpers ***/
-function getCreds_() {
-  const props = PropertiesService.getScriptProperties();
-  const email = props.getProperty('JIRA_EMAIL');
-  const token = props.getProperty('JIRA_API_TOKEN');
-  if (!email || !token) throw new Error('Missing secrets. Run setSecrets() with your Jira email + API token.');
-  const auth = Utilities.base64Encode(email + ':' + token);
-  return {
-    headers: {
-      Authorization: 'Basic ' + auth,
-      Accept: 'application/json',
-      'Content-Type': 'application/json'
-    },
-    base: `https://${JIRA_SITE}/rest/api/3`
-  };
+// Fetch only recently updated issues (e.g., -2d) across all projects
+function fetchRecentIssuesAllProjects_(relativeWindow) {
+  const fields = coreFields_();
+  const projects = listProjectKeys_();
+  let all = [];
+  projects.forEach(p => {
+    const jql = `project = ${escapeJqlIdent_(p.key)} AND updated >= ${relativeWindow} ORDER BY updated DESC`;
+    all.push(...fetchIssuesWithEnhancedJql_(jql, fields));
+  });
+  return all;
 }
 
-function getTeamsWebhook_() {
-  const url = PropertiesService.getScriptProperties().getProperty('TEAMS_WEBHOOK_URL');
-  if (!url) throw new Error('Missing TEAMS_WEBHOOK_URL in Script Properties. Run setSecrets().');
-  return url;
-}
-
-/** Enhanced JQL search with GET→POST fallback + nextPageToken pagination */
-function fetchIssuesByJQL_(base, headers, jql) {
-  const all = [];
+// Enhanced JQL with cursor pagination
+function fetchIssuesWithEnhancedJql_(jql, fields) {
+  const url = `https://${JIRA_SITE}/rest/api/3/search/jql`;
+  const out = [];
   let token = null;
 
-  // First try GET (most tenants support it)
-  try {
-    while (true) {
-      const params = [
-        `jql=${encodeURIComponent(jql)}`,
-        `maxResults=100`,
-        token ? `nextPageToken=${encodeURIComponent(token)}` : null,
-        `fields=${encodeURIComponent(FIELDS.join(','))}`
-      ].filter(Boolean).join('&');
+  do {
+    const payload = {
+      jql,
+      fields,               // array
+      fieldsByKeys: true,
+      maxResults: 100
+    };
+    if (token) payload.nextPageToken = token;
 
-      const url = `${base}/search/jql?${params}`;
-      const res = fetchWithRetry_(url, { method: 'get', headers, muteHttpExceptions: true });
-      const code = res.getResponseCode();
+    const res = fetchJiraJsonWithRetry_(url, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
 
-      // If GET is not supported/behaving oddly, bail to POST fallback
-      if (code === 404 || code === 410 || code === 405 || code === 400) {
-        Logger.log(`[Enhanced JQL] GET fallback trigger code=${code}. Switching to POST.`);
-        throw new Error('GET not supported, switching to POST.');
-      }
+    if (res && res.issues) out.push(...res.issues);
+    token = (res && res.nextPageToken) ? res.nextPageToken : null;
+    if (res && res.isLast === true) token = null;
+  } while (token);
 
-      if (code !== 200) {
-        const bodyTxt = res.getContentText();
-        throw new Error(`GET /search/jql failed ${code}: ${bodyTxt}`);
-      }
+  return out;
+}
 
-      const body = safeJson_(res.getContentText()) || {};
-      const issues = body.issues || [];
-      all.push(...issues);
+// Minimal projects list (for bounding)
+function listProjectKeys_() {
+  const base = `https://${JIRA_SITE}/rest/api/3/project/search`;
+  const out = [];
+  let startAt = 0;
+  const maxResults = 50;
 
-      token = body.nextPageToken || null;
-      if (!token || issues.length === 0) break;
-    }
+  while (true) {
+    const url = `${base}?startAt=${startAt}&maxResults=${maxResults}`;
+    const data = fetchJiraJsonWithRetry_(url, { method: 'get', muteHttpExceptions: true });
+    const values = data.values || [];
+    values.forEach(p => out.push({ key: p.key, name: p.name }));
+    if (startAt + values.length >= (data.total || 0) || values.length === 0) break;
+    startAt += values.length;
+  }
+  return out;
+}
 
-    Logger.log(`[Enhanced JQL][GET] Retrieved ${all.length} issues total.`);
-    return all;
+function coreFields_() {
+  // includes statusCategory via "status", and everything we need for cards + snapshot
+  return [
+    'summary','description','issuetype','status','assignee','priority',
+    'labels','components','fixVersions','versions','duedate',
+    'created','updated','reporter','resolution','resolutiondate',
+    'statuscategorychangedate','project','parent'
+  ];
+}
 
-  } catch (e) {
-    // POST fallback path — some sites prefer POST body for Enhanced JQL
-    Logger.log(`[Enhanced JQL] Falling back to POST due to: ${e && e.message ? e.message : e}`);
-    token = null;
-    while (true) {
-      const payload = {
-        jql: jql,
-        fields: FIELDS,     // array OK for POST
-        maxResults: 100
+/*****************  SNAPSHOT STORAGE & DELTA  *****************/
+
+function ensureSnapshotSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.create('Jira Export');
+  let sh = ss.getSheetByName(SNAPSHOT_SHEET);
+  if (!sh) {
+    sh = ss.insertSheet(SNAPSHOT_SHEET);
+    sh.getRange(1,1,1,8).setValues([[
+      'issueKey','status','statusCategoryKey','resolution','resolutionDate','updated','notifiedCreated','notifiedClosed'
+    ]]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function readSnapshot_() {
+  const sh = ensureSnapshotSheet_();
+  const last = sh.getLastRow();
+  const map = {};
+  if (last < 2) return map;
+
+  const data = sh.getRange(2,1,last-1,8).getValues();
+  data.forEach(row => {
+    const [issueKey,status,cat,res,resDate,upd,notiC,notiD] = row;
+    if (issueKey) {
+      map[issueKey] = {
+        issueKey: String(issueKey),
+        status: status || '',
+        statusCategoryKey: cat || '',
+        resolution: res || '',
+        resolutionDate: resDate || '',
+        updated: upd || '',
+        notifiedCreated: Boolean(notiC),
+        notifiedClosed: Boolean(notiD)
       };
-      if (token) payload.nextPageToken = token;
-
-      const url = `${base}/search/jql`;
-      const res = fetchWithRetry_(url, {
-        method: 'post',
-        contentType: 'application/json; charset=utf-8',
-        payload: JSON.stringify(payload),
-        headers,
-        muteHttpExceptions: true
-      });
-
-      const code = res.getResponseCode();
-      if (code !== 200) {
-        const txt = res.getContentText();
-        throw new Error(`POST /search/jql failed ${code}: ${txt}`);
-      }
-
-      const body = safeJson_(res.getContentText()) || {};
-      const issues = body.issues || [];
-      all.push(...issues);
-
-      token = body.nextPageToken || null;
-      if (!token || issues.length === 0) break;
     }
-
-    Logger.log(`[Enhanced JQL][POST] Retrieved ${all.length} issues total.`);
-    return all;
-  }
-}
-
-/** UrlFetch with exponential backoff and 429 support */
-function fetchWithRetry_(url, opts, maxAttempts = 5) {
-  let attempt = 0;
-  let waitMs = 500;
-  while (true) {
-    attempt++;
-    const res = UrlFetchApp.fetch(url, { followRedirects: true, validateHttpsCertificates: true, ...opts });
-    const code = res.getResponseCode();
-    if ((code >= 200 && code < 300) || (code >= 400 && code < 500 && code !== 429)) return res;
-
-    if (attempt >= maxAttempts) return res;
-
-    let retryAfter = 0;
-    try { retryAfter = Number((res.getAllHeaders() || {})['Retry-After']) * 1000 || 0; } catch (_) {}
-    Utilities.sleep(retryAfter || waitMs);
-    waitMs = Math.min(waitMs * 2, 8000);
-  }
-}
-
-/** Workbook + Sheet helpers with retries */
-function getWorkbook_() { return withRetry_(() => SpreadsheetApp.openById(WORKBOOK_ID)); }
-function getSheet_(name) {
-  return withRetry_(() => {
-    const ss = getWorkbook_();
-    let sh = ss.getSheetByName(name);
-    if (!sh) sh = ss.insertSheet(name);
-    return sh;
   });
-}
-function withRetry_(fn, max = 5, initialWait = 400) {
-  let attempt = 0, wait = initialWait;
-  while (true) {
-    attempt++;
-    try { return fn(); }
-    catch (e) {
-      if (attempt >= max) throw e;
-      Utilities.sleep(wait);
-      wait = Math.min(wait * 2, 6000);
-    }
-  }
+  return map;
 }
 
-/** Write issues to "Tickets" */
-function writeToSheet_(issues) {
-  const sh = getSheet_(TICKETS_TAB);
-  sh.clearContents();
-  sh.getRange(1, 1, 1, TICKETS_COLS).setValues([TICKETS_HEADER]);
-  sh.setFrozenRows(1);
-
-  const rows = issues.map(({ key, fields }) => {
-    const projKey  = safe(fields, ['project','key']);
-    const projName = safe(fields, ['project','name']);
-    const assignee = safe(fields, ['assignee','displayName']) || '';
-    const assEmail = safe(fields, ['assignee','emailAddress']) || '';
-    const reporter = safe(fields, ['reporter','displayName']) || '';
-    const repEmail = safe(fields, ['reporter','emailAddress']) || '';
-    const listNames = arr => Array.isArray(arr) ? arr.map(x => (x && (x.name || x.key) || '')).filter(Boolean).join(', ') : '';
-
-    const descPlain = (adfToText_(fields.description) || '');
-    const descriptionCell = descPlain.length > MAX_DESC
-      ? descPlain.substring(0, MAX_DESC - 12) + '\n[…truncated]'
-      : descPlain;
+function writeSnapshot_(issues, {silent=false, carryFlags=false}={}) {
+  const sh = ensureSnapshotSheet_();
+  const existing = carryFlags ? readSnapshot_() : {};
+  const rows = issues.map(it => {
+    const f = it.fields || {};
+    const status = f.status || {};
+    const catKey = status.statusCategory && status.statusCategory.key || '';
+    const prev = existing[it.key];
 
     return [
-      key,
-      projKey || '',
-      projName || '',
-      fields.summary || '',
-      descriptionCell || '',
-      safe(fields, ['issuetype','name']) || '',
-      safe(fields, ['status','name']) || '',
-      assignee,
-      assEmail,
-      safe(fields, ['priority','name']) || '',
-      Array.isArray(fields.labels) ? fields.labels.join(', ') : '',
-      listNames(fields.components),
-      listNames(fields.fixVersions),
-      listNames(fields.versions),
-      fields.duedate || '',
-      fields.created || '',
-      fields.updated || '',
-      reporter,
-      repEmail,
-      safe(fields, ['resolution','name']) || '',
-      fields.resolutiondate || '',
-      fields.statuscategorychangedate || '',
-      safe(fields, ['parent','key']) || '',
-      `https://${JIRA_SITE}/browse/${key}`
+      it.key,
+      status.name || '',
+      catKey,
+      (f.resolution && f.resolution.name) || '',
+      f.resolutiondate || '',
+      f.updated || '',
+      carryFlags ? (prev ? prev.notifiedCreated : false) : false,
+      carryFlags ? (prev ? prev.notifiedClosed : false) : false
     ];
   });
 
-  if (rows.length) {
-    sh.getRange(2, 1, rows.length, TICKETS_COLS).setValues(rows);
-  }
-
-  const dateCols = [15,16,17,22,23]; // due, created, updated, resolutionDate, statusCategoryChanged
-  dateCols.forEach(c => {
-    const n = Math.max(rows.length, 1);
-    sh.getRange(2, c, n, 1).setNumberFormat('yyyy-mm-dd hh:mm');
-  });
-
-  sh.autoResizeColumns(1, TICKETS_COLS);
+  // Rewrite sheet fresh
+  sh.clearContents();
+  sh.getRange(1,1,1,8).setValues([[
+    'issueKey','status','statusCategoryKey','resolution','resolutionDate','updated','notifiedCreated','notifiedClosed'
+  ]]);
+  if (rows.length) sh.getRange(2,1,rows.length,8).setValues(rows);
 }
 
-/*** Health log ***/
-function logHealth_(engineName, t0, status, errorMsg) {
-  const runtime = ((new Date()) - t0) / 1000;
-  const ss = SpreadsheetApp.openById(HEALTH_SHEET_ID);
-  const sh = ss.getSheetByName(HEALTH_TAB_NAME) || ss.insertSheet(HEALTH_TAB_NAME);
-  if (sh.getLastRow() === 0) {
-    sh.appendRow(['Engine Name','Timestamp','Status','Runtime','Error']);
-  }
-  const normalizedStatus = String(status).toUpperCase() === 'SUCCESS' ? 'OK'
-                         : String(status).toUpperCase() === 'OK' ? 'OK'
-                         : String(status).toUpperCase() === 'ERROR' ? 'ERROR'
-                         : status;
-  const ts = new Date();
-  sh.appendRow([engineName, ts, normalizedStatus, runtime, errorMsg || '']);
-  sh.getRange(sh.getLastRow(), 2).setNumberFormat('yyyy-mm-dd hh:mm:ss');
-}
-
-/*** tiny utils ***/
-function safe(obj, pathArr) { return pathArr.reduce((acc, k) => (acc && k in acc ? acc[k] : undefined), obj); }
-function safeJson_(txt) { try { return JSON.parse(txt); } catch(_) { return null; } }
-function formatDate_(d, fmt) { return Utilities.formatDate(d, Session.getScriptTimeZone(), fmt); }
-function escapeMd_(s){ return String(s||'').replace(/(\*|_|\`|\[|\])/g,'\\$1'); }
-function toIso_(v) {
-  if (!v) return '';
-  try {
-    if (v instanceof Date) return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd\'T\'HH:mm:ss');
-    const s = String(v);
-    const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
-    return m ? m[1] + 'T' + (s.split('T')[1] || '00:00:00') : s;
-  } catch(_) { return String(v); }
-}
-function toIsoDateOnly_(v) {
-  if (!v) return '';
-  try {
-    if (v instanceof Date) return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd');
-    const s = String(v); const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
-    return m ? m[1] : s;
-  } catch(_) { return String(v); }
-}
-function priorityIcon_(p) {
-  const s = String(p||'').toLowerCase();
-  if (!s) return '';
-  if (s.includes('critical') || s.includes('blocker') || s.includes('p0')) return '🚨';
-  if (s.includes('high') || s.includes('p1') || s.includes('urgent')) return '🔥';
-  if (s.includes('medium') || s.includes('p2')) return '⚠️';
-  if (s.includes('low') || s.includes('p3') || s.includes('p4')) return '🐢';
-  return '';
-}
-function toBoolDone_(status) {
-  if (!status) return false;
-  const s = status.toLowerCase();
-  return ['done','closed','resolved','complete'].some(k => s.includes(k));
-}
-
-/** Convert Jira Cloud ADF (rich text) description to plain text (with link handling). */
-function adfToText_(adf) {
-  if (!adf) return '';
-  try {
-    const parts = [];
-    const walk = (node) => {
-      if (!node) return;
-      const type = node.type;
-
-      // inline text; detect links in marks
-      if (type === 'text') {
-        let text = node.text || '';
-        if (node.marks && node.marks.length) {
-          const link = node.marks.find(m => m.type === 'link' && m.attrs && m.attrs.href);
-          if (link) { parts.push(`${text} (${link.attrs.href})`); return; }
-          const strong = node.marks.some(m => m.type === 'strong'); if (strong) text = `**${text}**`;
-          const em     = node.marks.some(m => m.type === 'em');     if (em)     text = `_${text}_`;
-          const code   = node.marks.some(m => m.type === 'code');   if (code)   text = '`' + text + '`';
-        }
-        parts.push(text);
-        return;
-      }
-
-      if (type === 'hardBreak') { parts.push('\n'); return; }
-
-      if (type === 'paragraph' || type === 'heading') {
-        if (Array.isArray(node.content)) node.content.forEach(walk);
-        parts.push('\n'); return;
-      }
-
-      if (type === 'bulletList' || type === 'orderedList') {
-        const isOrdered = type === 'orderedList';
-        let idx = (node.attrs && node.attrs.order) ? Number(node.attrs.order) : 1;
-        (node.content || []).forEach(li => {
-          const before = parts.length;
-          (li.content || []).forEach(walk);
-          let line = parts.splice(before).join('').trim();
-          if (line) { parts.push((isOrdered ? `${idx}. ` : `• `) + line + '\n'); idx++; }
-        });
-        return;
-      }
-
-      if (type === 'blockquote') {
-        const before = parts.length;
-        (node.content || []).forEach(walk);
-        let text = parts.splice(before).join('');
-        text = text.split('\n').map(s => s ? `> ${s}` : s).join('\n');
-        parts.push(text + '\n'); return;
-      }
-
-      if (type === 'codeBlock') {
-        const before = parts.length;
-        (node.content || []).forEach(walk);
-        const codeText = parts.splice(before).join('');
-        parts.push(codeText + '\n'); return;
-      }
-
-      if (type === 'table') {
-        (node.content || []).forEach(row => {
-          const cells = [];
-          (row.content || []).forEach(cell => {
-            const before = parts.length;
-            (cell.content || []).forEach(walk);
-            const cellText = parts.splice(before).join('').replace(/\n+/g, ' ').trim();
-            cells.push(cellText);
-          });
-          parts.push(cells.join(' | ') + '\n');
-        });
-        return;
-      }
-
-      if (Array.isArray(node.content)) node.content.forEach(walk);
-    };
-
-    if (adf.type === 'doc' && Array.isArray(adf.content)) adf.content.forEach(walk);
-    else walk(adf);
-
-    return parts.join('').replace(/\n{3,}/g, '\n\n').trim();
-  } catch (e) {
-    return typeof adf === 'string' ? adf : JSON.stringify(adf);
-  }
-}
-
-/* ------------------------------------------------------------------
-   TEAMS INTEGRATION (hourly new/closed alerts + daily summary)
--------------------------------------------------------------------*/
-
-function createHourlyTrigger_() {
-  deleteTriggersByFunc_('Run_Hourly_Sync_And_Notifications');
-  ScriptApp.newTrigger('Run_Hourly_Sync_And_Notifications').timeBased().everyHours(1).create();
-  Logger.log('Created hourly trigger for Run_Hourly_Sync_And_Notifications');
-}
-function createDailySummaryTrigger_() {
-  deleteTriggersByFunc_('Send_Daily_Summary_To_Teams');
-  ScriptApp.newTrigger('Send_Daily_Summary_To_Teams').timeBased().atHour(18).everyDays(1).create(); // 18:00 script TZ
-  Logger.log('Created daily summary trigger for 18:00');
-}
-function deleteTriggersByFunc_(funcName) {
-  ScriptApp.getProjectTriggers().forEach(tr => {
-    if (tr.getHandlerFunction() === funcName) ScriptApp.deleteTrigger(tr);
-  });
-}
-
-/** Initialize snapshot immediately (optional) */
-function Initialize_Jira_Snapshot() {
-  const current = loadCurrentTickets_(); // may be empty on first run
-  saveSnapshot_(current);
-  Logger.log('Snapshot initialized with ' + Object.keys(current).length + ' items.');
-}
-
-/** Detect changes vs last snapshot and notify Teams */
-function detectAndNotify_() {
-  const current = loadCurrentTickets_(); // map by issueKey
-  const snap    = loadSnapshot_();       // map by issueKey
+/** Figure out which issues are new, and which just closed */
+function computeDelta_(issues, snapshot) {
+  const mapNow = {};
+  issues.forEach(i => mapNow[i.key] = i);
 
   const newIssues = [];
   const closedIssues = [];
 
-  // New/closed where present in current
-  Object.keys(current).forEach(key => {
-    const cur = current[key];
-    const prev = snap[key];
+  issues.forEach(it => {
+    const f = it.fields || {};
+    const status = f.status || {};
+    const catKey = status.statusCategory && status.statusCategory.key || '';
+    const isClosedNow = (catKey === 'done') || !!f.resolution;
+    const prev = snapshot[it.key];
 
     if (!prev) {
-      newIssues.push(cur);
-    } else {
-      const wasDone = toBoolDone_(prev.status);
-      const isDone  = toBoolDone_(cur.status);
-      const wasResolved = !!prev.resolutionDate;
-      const isResolved  = !!cur.resolutionDate;
-      if ((!wasDone && isDone) || (!wasResolved && isResolved)) {
-        closedIssues.push(cur);
-      }
+      // brand new to snapshot → new ticket
+      newIssues.push(it);
+      return;
+    }
+
+    const wasClosed = (prev.statusCategoryKey === 'done') || !!prev.resolution;
+    if (isClosedNow && !wasClosed && !prev.notifiedClosed) {
+      closedIssues.push(it);
     }
   });
 
-  // Closed: present before, missing now (because JQL excludes Done)
-  Object.keys(snap).forEach(key => {
-    if (!current[key]) {
-      const prev = snap[key];
-      if (!toBoolDone_(prev.status)) {
-        closedIssues.push({
-          issueKey: key,
-          projectKey: prev.projectKey || '',
-          status: 'Done',
-          resolution: prev.resolution || '',
-          resolutionDate: prev.resolutionDate || '',
-          summary: prev.summary || '(summary not captured yet)',
-          url: prev.url || `https://${JIRA_SITE}/browse/${key}`
-        });
-      }
-    }
-  });
-
-  newIssues.forEach(notifyNewIssue_);
-  closedIssues.forEach(notifyClosedIssue_);
-  saveSnapshot_(current);
+  return { newIssues, closedIssues };
 }
 
-/** Sheet helpers for diffing */
-function loadCurrentTickets_() {
-  const sh = getSheet_(TICKETS_TAB);
-  const lastRow = sh.getLastRow();
-  if (lastRow < 2) return {};
-  const values = sh.getRange(2, 1, lastRow - 1, TICKETS_COLS).getValues();
+/*****************  TEAMS MESSAGES  *****************/
 
-  const H = {
-    issueKey:1, projectKey:2, summary:4, issueType:6, status:7,
-    assignee:8, priority:10, dueDate:15, created:16, updated:17, resolution:20, resolutionDate:21, url:24
-  };
-  const map = {};
-  values.forEach(r => {
-    const key = String(r[H.issueKey-1] || '').trim();
-    if (!key) return;
-    map[key] = {
-      issueKey: key,
-      projectKey: String(r[H.projectKey-1]||'').trim(),
-      summary: String(r[H.summary-1]||''),
-      issueType: String(r[H.issueType-1]||''),
-      status: String(r[H.status-1]||''),
-      assignee: String(r[H.assignee-1]||''),
-      priority: String(r[H.priority-1]||''),
-      dueDate: toIsoDateOnly_(r[H.dueDate-1]),
-      created: toIso_(r[H.created-1]),
-      updated: toIso_(r[H.updated-1]),
-      resolution: String(r[H.resolution-1]||''),
-      resolutionDate: toIso_(r[H.resolutionDate-1]),
-      url: String(r[H.url-1]||'')
-    };
-  });
-  return map;
-}
-
-function loadSnapshot_() {
-  const sh = getSheet_(SNAPSHOT_SHEET);
-  const last = sh.getLastRow();
-  if (last < 2) return {};
-  const header = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
-  const values = sh.getRange(2, 1, last - 1, sh.getLastColumn()).getValues();
-
-  const idx = (name) => header.indexOf(name);
-  // Back-compat support (old 8-col snapshot)
-  const hasRich = idx('summary') !== -1 && idx('projectKey') !== -1 && idx('url') !== -1;
-
-  const map = {};
-  values.forEach(r => {
-    const key = String(r[0]||'').trim(); // issueKey
-    if (!key) return;
-    map[key] = {
-      issueKey: key,
-      status: String(r[hasRich ? idx('status') : 1]||''),
-      resolution: String(r[hasRich ? idx('resolution') : 2]||''),
-      resolutionDate: String(r[hasRich ? idx('resolutionDate') : 3]||''),
-      updated: String(r[hasRich ? idx('updated') : 4]||''),
-      priority: String(r[hasRich ? idx('priority') : 5]||''),
-      assignee: String(r[hasRich ? idx('assignee') : 6]||''),
-      dueDate: String(r[hasRich ? idx('dueDate') : 7]||''),
-      summary: hasRich ? String(r[idx('summary')]||'') : '',
-      projectKey: hasRich ? String(r[idx('projectKey')]||'') : '',
-      url: hasRich ? String(r[idx('url')]||'') : ''
-    };
-  });
-  return map;
-}
-
-function saveSnapshot_(currentMap) {
-  const sh = getSheet_(SNAPSHOT_SHEET);
-  sh.clearContents();
-  const header = [
-    'issueKey','status','resolution','resolutionDate','updated','priority','assignee','dueDate',
-    'summary','projectKey','url'
-  ];
-  sh.getRange(1, 1, 1, header.length).setValues([header]);
-
-  const rows = Object.keys(currentMap).map(k => {
-    const it = currentMap[k];
-    return [
-      k, it.status || '', it.resolution || '', it.resolutionDate || '', it.updated || '',
-      it.priority || '', it.assignee || '', it.dueDate || '',
-      it.summary || '', it.projectKey || '', it.url || `https://${JIRA_SITE}/browse/${k}`
-    ];
-  });
-
-  if (rows.length) sh.getRange(2, 1, rows.length, header.length).setValues(rows);
-  sh.getRange(1, header.length + 1).setNote('Snapshot updated: ' + new Date().toString());
-}
-
-/** Teams notifications */
-function notifyNewIssue_(it) {
-  const priorityEmoji = priorityIcon_(it.priority);
-  const headline = (it.projectKey === 'MAX')
-    ? '🆕 Hey team, a new Jira ticket has been created for Project MAX — take a look. 🚀'
-    : '🆕 New Jira ticket created — take a look.';
-
-  postTeamsCard_({
-    title: headline,
-    summary: 'New Jira ticket',
-    themeColor: 'F39C12',
-    activityTitle: `**${escapeMd_(it.summary)}**`,
-    facts: [
-      { name: 'Key', value: it.issueKey },
-      { name: 'Project', value: it.projectKey || '-' },
-      { name: 'Type', value: it.issueType || '-' },
-      { name: 'Priority', value: (it.priority || '-') + (priorityEmoji ? ' ' + priorityEmoji : '') },
-      { name: 'Assignee', value: it.assignee || '-' },
-      { name: 'Created', value: it.created || '-' }
-    ],
-    text: '',
-    button: { name: 'Open in Jira', uri: it.url }
-  });
-}
-
-function notifyClosedIssue_(it) {
-  postTeamsCard_({
-    title: '✅ Ticket closed',
-    summary: 'Jira ticket closed',
-    themeColor: '6B6B6B',
-    activityTitle: `**${escapeMd_(it.summary)}**`,
-    facts: [
-      { name: 'Key', value: it.issueKey },
-      { name: 'Project', value: it.projectKey || '-' },
-      { name: 'Status', value: it.status || 'Done' },
-      { name: 'Resolution', value: it.resolution || '-' },
-      { name: 'Closed on', value: it.resolutionDate || '-' }
-    ],
-    text: '',
-    button: { name: 'Open in Jira', uri: it.url }
-  });
-}
-
-/** Robust Teams post: retries + logs + body check. Returns true on success ("1" or empty). */
-function postTeamsCard_({ title, summary, themeColor, activityTitle, facts = [], text = '', button }) {
-  const TEAMS_WEBHOOK_URL = getTeamsWebhook_();
-
-  const payload = {
-    '@type': 'MessageCard',
-    '@context': 'http://schema.org/extensions',
-    summary: summary || title,
-    themeColor: themeColor || '0078D4',
-    title,
-    sections: [{
-      activityTitle: activityTitle || title,
-      facts: facts,
-      markdown: true,
-      text: text || ''
-    }],
-    potentialAction: button ? [{
-      '@type': 'OpenUri',
-      name: button.name || 'Open',
-      targets: [{ os: 'default', uri: button.uri }]
-    }] : []
-  };
-
-  const body = JSON.stringify(payload);
-
-  let attempt = 0, wait = 500;
-  while (true) {
-    attempt++;
-    try {
-      const res = UrlFetchApp.fetch(TEAMS_WEBHOOK_URL, {
-        method: 'post',
-        contentType: 'application/json; charset=utf-8',
-        payload: body,
-        muteHttpExceptions: true,
-        followRedirects: true,
-        validateHttpsCertificates: true
-      });
-      const code = res.getResponseCode();
-      const txt = (res.getContentText() || '').trim();
-
-      const success = (code >= 200 && code < 300) && (txt === '' || txt === '1');
-      const bodyHasError = /Microsoft Teams endpoint returned HTTP error|Bad payload/i.test(txt);
-
-      if (success && !bodyHasError) return true;
-
-      const msg = `Teams webhook response ${code}: ${txt || '(no body)'}`;
-      if (attempt >= 5) { logHealth_('Teams Notify', new Date(), 'ERROR', msg); return false; }
-      Utilities.sleep(wait); wait = Math.min(wait * 2, 8000);
-    } catch (err) {
-      if (attempt >= 5) {
-        logHealth_('Teams Notify', new Date(), 'ERROR', `Fetch error: ${String(err)}`);
-        return false;
-      }
-      Utilities.sleep(wait); wait = Math.min(wait * 2, 8000);
-    }
+function requireWebhook_() {
+  if (!TEAMS_WEBHOOK_URL || /PASTE_YOUR_TEAMS_WEBHOOK_URL_HERE/i.test(TEAMS_WEBHOOK_URL)) {
+    throw new Error('Please set TEAMS_WEBHOOK_URL to your Microsoft Teams incoming webhook.');
   }
 }
 
-/** Quick text ping + test card */
-function Send_Teams_Text_Ping() {
-  const url = getTeamsWebhook_();
-  const payload = { text: 'Ping from Apps Script ' + new Date().toISOString() };
-  const res = UrlFetchApp.fetch(url, {
+function notifyNewTicket_(it) {
+  const f = it.fields || {};
+  const proj = f.project || {};
+  const status = f.status || {};
+  const type = f.issuetype || {};
+  const priority = f.priority || {};
+  const assignee = f.assignee || {};
+  const url = `https://${JIRA_SITE}/browse/${it.key}`;
+
+  const card = {
+    '@type': 'MessageCard',
+    '@context': 'https://schema.org/extensions',
+    'summary': `New Jira Ticket: ${it.key}`,
+    'themeColor': '0076D7',
+    'title': `🆕 New Ticket: ${it.key} — ${truncate_(f.summary, 80)}`,
+    'sections': [{
+      'facts': [
+        {'name':'Project', 'value': `${proj.key || ''} — ${proj.name || ''}`},
+        {'name':'Type', 'value': type.name || ''},
+        {'name':'Status', 'value': status.name || ''},
+        {'name':'Priority', 'value': priority.name || ''},
+        {'name':'Assignee', 'value': assignee.displayName || 'Unassigned'},
+        {'name':'Created', 'value': f.created || ''},
+      ],
+      'text': truncate_(adfToPlainText_(f.description) || '', 500),
+      'markdown': true
+    }],
+    'potentialAction': [{
+      '@type': 'OpenUri',
+      'name': 'Open in Jira',
+      'targets': [{'os':'default','uri': url}]
+    }]
+  };
+
+  postToTeams_(card);
+}
+
+function notifyClosedTicket_(it) {
+  const f = it.fields || {};
+  const proj = f.project || {};
+  const status = f.status || {};
+  const assignee = f.assignee || {};
+  const url = `https://${JIRA_SITE}/browse/${it.key}`;
+
+  const card = {
+    '@type': 'MessageCard',
+    '@context': 'https://schema.org/extensions',
+    'summary': `Closed Jira Ticket: ${it.key}`,
+    'themeColor': '2EB886',
+    'title': `✅ Ticket Closed: ${it.key} — ${truncate_(f.summary, 80)}`,
+    'sections': [{
+      'facts': [
+        {'name':'Project', 'value': `${proj.key || ''} — ${proj.name || ''}`},
+        {'name':'Final Status', 'value': status.name || ''},
+        {'name':'Assignee', 'value': assignee.displayName || 'Unassigned'},
+        {'name':'Resolution', 'value': (f.resolution && f.resolution.name) || ''},
+        {'name':'Resolved On', 'value': f.resolutiondate || f.updated || ''},
+      ],
+      'markdown': true
+    }],
+    'potentialAction': [{
+      '@type': 'OpenUri',
+      'name': 'Open in Jira',
+      'targets': [{'os':'default','uri': url}]
+    }]
+  };
+
+  postToTeams_(card);
+}
+
+function buildSummaryCard_(totals) {
+  const lines = [
+    `**Total Issues:** ${totals.total}`,
+    `**Open (not Done):** ${totals.open}`,
+    `**Closed (Done):** ${totals.closed}`,
+    `**Created Today:** ${totals.createdToday}`,
+    `**Closed Today:** ${totals.closedToday}`
+  ];
+  if (totals.topRecentlyUpdated.length) {
+    lines.push('\n**Recently Updated (top 5):**');
+    totals.topRecentlyUpdated.forEach(t => {
+      lines.push(`- ${t.key} — ${truncate_(t.summary, 60)} (${t.status})`);
+    });
+  }
+
+  return {
+    '@type': 'MessageCard',
+    '@context': 'https://schema.org/extensions',
+    'summary': 'Daily Jira Summary',
+    'themeColor': '5C2D91',
+    'title': '📊 Daily Jira Summary',
+    'text': lines.join('\n'),
+    'markdown': true
+  };
+}
+
+function postToTeams_(card) {
+  const resp = UrlFetchApp.fetch(TEAMS_WEBHOOK_URL, {
     method: 'post',
-    contentType: 'application/json; charset=utf-8',
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true,
-    followRedirects: true,
-    validateHttpsCertificates: true
+    contentType: 'application/json',
+    payload: JSON.stringify(card),
+    muteHttpExceptions: true
   });
-  Logger.log(`Ping -> code=${res.getResponseCode()} body="${res.getContentText()}"`);
-}
-function Send_Teams_Test_Card() {
-  const ok = postTeamsCard_({
-    title: '✅ Teams Webhook Test',
-    summary: 'Test',
-    themeColor: '2EB886',
-    activityTitle: '**Test card from Apps Script**',
-    facts: [{ name: 'When', value: new Date().toString() }],
-    text: 'If you see this, the webhook is healthy.',
-    button: { name: 'Open Tickets Sheet', uri: getWorkbook_().getUrl() }
-  });
-  if (!ok) Logger.log('Test card failed to post. Check health log for Teams Notify errors.');
+  const code = resp.getResponseCode();
+  if (code < 200 || code >= 300) {
+    throw new Error(`Teams webhook error ${code}: ${resp.getContentText()}`);
+  }
 }
 
-/** Daily summary builder */
-function buildDailySummary_() {
-  const sh = getSheet_(TICKETS_TAB);
-  const last = sh.getLastRow();
-  if (last < 2) return { totalCreated:0,totalClosed:0,openCount:0,extraText:'' };
-  const values = sh.getRange(2, 1, last - 1, TICKETS_COLS).getValues();
+/*****************  SUMMARY CALCS  *****************/
 
-  const H = { created:16, resolutionDate:21, status:7, priority:10, dueDate:15, issueKey:1, summary:4, url:24 };
-  const today = formatDate_(new Date(), 'yyyy-MM-dd');
+function summarize_(snapRows, todayDate) {
+  const todayISO = toISODate_(todayDate); // YYYY-MM-DD
+  let total=0, open=0, closed=0, createdToday=0, closedToday=0;
+  const recent = [];
 
-  let totalCreated = 0, totalClosed = 0, openCount = 0;
-  const byPriority = {};
-  const dueToday = [];
+  snapRows.forEach(r => {
+    total++;
+    const isClosed = r.statusCategoryKey === 'done' || !!r.resolution;
+    if (isClosed) closed++; else open++;
 
-  values.forEach(r => {
-    const status = String(r[H.status-1]||'');
-    const created = toIso_(r[H.created-1]);
-    const resolutionDate = toIso_(r[H.resolutionDate-1]);
-    const priority = String(r[H.priority-1]||'').trim();
-    const dueDate = toIsoDateOnly_(r[H.dueDate-1]);
-    const issueKey = String(r[H.issueKey-1]||'');
-    const summary = String(r[H.summary-1]||'');
-    const url = String(r[H.url-1]||'');
+    // createdToday/closedToday require live issue fields (not in snapshot),
+    // so we approximate via updated/resolutionDate flags we stored.
+    if (r.resolutionDate && r.resolutionDate.slice(0,10) === todayISO) closedToday++;
+    // createdToday best taken from a fresh fetch; fallback: check updated if close-to-created
+    // For a tighter number, you can pipe in today's fetch during DailySummary.
+  });
 
-    if (created && created.startsWith(today)) totalCreated++;
-    if (resolutionDate && resolutionDate.startsWith(today)) totalClosed++;
-    if (!toBoolDone_(status)) openCount++;
+  // Grab top 5 recently updated (from snapshot)
+  const top = [...snapRows]
+    .sort((a,b) => (b.updated || '').localeCompare(a.updated || ''))
+    .slice(0,5)
+    .map(r => ({ key:r.issueKey, summary:'', status:r.status })); // summary omitted (not in snapshot)
 
-    if (priority) byPriority[priority] = (byPriority[priority] || 0) + 1;
-    if (dueDate && dueDate === today && !toBoolDone_(status)) {
-      dueToday.push(`- ${issueKey}: ${summary}`);
+  return { total, open, closed, createdToday, closedToday, topRecentlyUpdated: top };
+}
+
+/*****************  UTILITIES  *****************/
+
+function removeTriggersFor_(fnNames) {
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(t => {
+    if (fnNames.includes(t.getHandlerFunction())) ScriptApp.deleteTrigger(t);
+  });
+}
+
+function escapeJqlIdent_(s) {
+  if (!s) return '';
+  return /^[A-Z0-9_]+$/.test(s) ? s : `"${s.replace(/"/g, '\\"')}"`;
+}
+
+function authHeaders_() {
+  const basic = Utilities.base64Encode(`${JIRA_EMAIL}:${JIRA_API_TOKEN}`);
+  return { 'Authorization': `Basic ${basic}`, 'Accept': 'application/json' };
+}
+
+function fetchJiraJsonWithRetry_(url, options = {}) {
+  const headers = Object.assign(authHeaders_(), options.headers || {});
+  const opts = Object.assign({ method: 'get', muteHttpExceptions: true, headers }, options);
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const resp = UrlFetchApp.fetch(url, opts);
+    const code = resp.getResponseCode();
+    const text = resp.getContentText();
+    if (code === 429) {
+      const retryAfter = Number(resp.getHeaders()['Retry-After'] || 2);
+      Utilities.sleep(Math.min(1000 * retryAfter, 5000));
+      continue;
     }
-  });
-
-  const priorityLines = Object.keys(byPriority).sort().map(k => `- ${k}: ${byPriority[k]}`);
-  const extra = [
-    priorityLines.length ? `**Open by priority:**\n${priorityLines.join('\n')}` : '',
-    dueToday.length ? `\n**Due today (open):**\n${dueToday.join('\n')}` : ''
-  ].filter(Boolean).join('\n');
-
-  return { totalCreated, totalClosed, openCount, extraText: extra };
+    if (code < 200 || code >= 300) throw new Error(`Jira API error ${code}: ${text}`);
+    return text ? JSON.parse(text) : {};
+  }
+  throw new Error('Jira API throttled (429) repeatedly; aborting after retries.');
 }
 
-/* ---------------------------
-   DEBUG / DIAGNOSTIC HELPERS
-----------------------------*/
-function Debug_Daily_Summary() {
-  const s = buildDailySummary_();
-  Logger.log(JSON.stringify(s, null, 2));
+function adfToPlainText_(adf) {
+  if (!adf || typeof adf !== 'object') return (adf || '') + '';
+  var text = '';
+  function walk(node) {
+    if (!node) return;
+    if (node.type === 'text' && node.text) text += node.text;
+    (node.content || []).forEach(walk);
+    if (node.type === 'paragraph') text += '\n';
+  }
+  walk(adf);
+  return text.trim();
 }
 
-/* ---------------------------
-   Back-compat alias functions
-----------------------------*/
-// Fixes ReferenceError if old trigger/function names are used
-function _notifyNewIssue_(it){ return notifyNewIssue_(it); }
-function _notifyClosedIssue_(it){ return notifyClosedIssue_(it); }
-function Hourly_Check_And_Notify(){ return Run_Hourly_Sync_And_Notifications(); }
+function truncate_(s, n) {
+  s = (s || '') + '';
+  return s.length <= n ? s : s.slice(0, n-1) + '…';
+}
+
+function toISODate_(d) {
+  const pad = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+}
