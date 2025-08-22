@@ -1,0 +1,272 @@
+/*************************************************
+ * MAXX — Dual-Jira Mirror v3.1 (Internal → Partner)
+ * - Enhanced JQL (/rest/api/3/search/jql) with GET→POST fallback + nextPageToken
+ * - Dedupe by summary tag "[<SOURCEKEY>]" using Unicode escapes for [ and ]
+ * - Safe create payload (summary, issuetype, ADF description) to avoid screen errors
+ * - Remote link back to internal issue
+ **************************************************/
+
+/*** 0) HARDCODED CREDS & PROJECT KEYS ***/
+// INTERNAL (Latcha)
+const INTERNAL = {
+  SITE : 'latcha.atlassian.net',
+  EMAIL: 'indira.r@clictechnologies.com',
+  TOKEN: ''
+};
+// PARTNER (Ready2Ride Marketing)
+const PARTNER = {
+  SITE : 'ready2ridemobile-marketing.atlassian.net',
+  EMAIL: 'marketing@ready2ridemobile.com',
+  TOKEN: ''
+};
+
+// Project keys
+const INTERNAL_PROJECT_KEY = 'MP';   // on Latcha
+const PARTNER_PROJECT_KEY  = 'MP';   // mirrored on partner
+
+/*************** Core HTTP helpers ***************/
+function _creds(side) {
+  const S = (side === 'internal') ? INTERNAL : PARTNER;
+  const auth = Utilities.base64Encode(S.EMAIL + ':' + S.TOKEN);
+  return {
+    base: `https://${S.SITE}/rest/api/3`,
+    headers: {
+      Authorization: 'Basic ' + auth,
+      Accept: 'application/json',
+      'Content-Type': 'application/json'
+    }
+  };
+}
+
+function _jiraFetch(url, opts = {}, tries = 5) {
+  let wait = 500;
+  for (let i = 0; i < tries; i++) {
+    const res = UrlFetchApp.fetch(url, { muteHttpExceptions:true, followRedirects:true, validateHttpsCertificates:true, ...opts });
+    const code = res.getResponseCode();
+    if ((code >= 200 && code < 300) || (code >= 400 && code < 500 && code !== 429)) return res;
+    const ra = Number((res.getAllHeaders()||{})['Retry-After']) * 1000 || 0;
+    Utilities.sleep(ra || wait); wait = Math.min(wait * 2, 8000);
+  }
+  return UrlFetchApp.fetch(url, { muteHttpExceptions:true, ...opts });
+}
+
+function _jsonOrDie(res, label) {
+  const code = res.getResponseCode();
+  const txt  = res.getContentText();
+  if (code < 200 || code >= 300) throw new Error(`${label} failed ${code}: ${txt}`);
+  try { return JSON.parse(txt || '{}'); } catch (e) { throw new Error(`${label} invalid JSON: ${e}`); }
+}
+
+/*************** WhoAmI / Projects ***************/
+function _whoAmI(side) {
+  const { base, headers } = _creds(side);
+  return _jsonOrDie(_jiraFetch(`${base}/myself`, { method:'get', headers }), `${side} myself`);
+}
+function _listProjects(side) {
+  const { base, headers } = _creds(side);
+  const j = _jsonOrDie(_jiraFetch(`${base}/project/search?expand=lead`, { method:'get', headers }), `${side} project/search`);
+  return (j.values || []).map(p => ({ id:p.id, key:p.key, name:p.name, style:p.style || p.projectTypeKey }));
+}
+
+/*************** Enhanced JQL Search ***************/
+function _searchEnhanced(side, jql, fieldsArr) {
+  const { base, headers } = _creds(side);
+  const fields = fieldsArr && fieldsArr.length ? fieldsArr : ['summary','description','issuetype','status','project','updated'];
+  const all = [];
+  let token = null;
+
+  // Try GET first
+  try {
+    while (true) {
+      const qs = [
+        `jql=${encodeURIComponent(jql)}`,
+        `maxResults=100`,
+        token ? `nextPageToken=${encodeURIComponent(token)}` : null,
+        `fields=${encodeURIComponent(fields.join(','))}`
+      ].filter(Boolean).join('&');
+      const res = _jiraFetch(`${base}/search/jql?${qs}`, { method:'get', headers });
+      if (res.getResponseCode() !== 200) throw new Error('GET not supported for search/jql');
+      const body = _jsonOrDie(res, `${side} search/jql(GET)`);
+      const items = body.issues || [];
+      all.push(...items);
+      token = body.nextPageToken || null;
+      if (!token || items.length === 0) break;
+    }
+    return all;
+  } catch (e) {
+    // POST fallback
+    token = null;
+    while (true) {
+      const payload = { jql, fields, maxResults: 100 };
+      if (token) payload.nextPageToken = token;
+      const res = _jiraFetch(`${base}/search/jql`, {
+        method:'post',
+        headers,
+        contentType:'application/json; charset=utf-8',
+        payload: JSON.stringify(payload)
+      });
+      if (res.getResponseCode() !== 200) throw new Error(`search/jql(POST) failed ${res.getResponseCode()}: ${res.getContentText()}`);
+      const body = _jsonOrDie(res, `${side} search/jql(POST)`);
+      const items = body.issues || [];
+      all.push(...items);
+      token = body.nextPageToken || null;
+      if (!token || items.length === 0) break;
+    }
+    return all;
+  }
+}
+
+/*************** Utils ***************/
+function _summaryTag(sourceKey) { return `[${sourceKey}]`; }
+
+// JQL literal for CONTAINS (~) that includes literal [ and ]
+// - Do NOT escape with \[ or \] (illegal). Use Unicode \u005B and \u005D.
+// - Also escape backslash and quotes to keep the string valid.
+function _jqlContainsLiteral(s) {
+  return String(s)
+    .replace(/\\/g, '\\\\')     // literal backslash
+    .replace(/"/g, '\\"')       // literal quote
+    .replace(/\[/g, '\\u005B')  // [
+    .replace(/\]/g, '\\u005D'); // ]
+}
+
+function _toADF(text) {
+  return { type:'doc', version:1, content:[{ type:'paragraph', content:[{ type:'text', text: String(text || '') }]}] };
+}
+
+/*************** Sanity & Bootstrap ***************/
+function Setup_Sanity() {
+  const meInt = _whoAmI('internal');
+  const mePar = _whoAmI('partner');
+  Logger.log(`[internal] ${meInt.displayName} ${meInt.accountId}`);
+  Logger.log(`[partner] ${mePar.displayName} ${mePar.accountId}`);
+  Logger.log('[internal] projects: ' + JSON.stringify(_listProjects('internal'), null, 2));
+  Logger.log('[partner]  projects: ' + JSON.stringify(_listProjects('partner'),  null, 2));
+  Logger.log(`Run Ensure_Target_Project_On_Partner() if partner is missing ${INTERNAL_PROJECT_KEY}.`);
+}
+
+function Ensure_Target_Project_On_Partner() {
+  const have = _listProjects('partner').some(p => p.key === PARTNER_PROJECT_KEY);
+  if (have) { Logger.log(`[ensure] partner already has ${PARTNER_PROJECT_KEY}`); return; }
+
+  const { base, headers } = _creds('partner');
+  const me = _whoAmI('partner'); // for leadAccountId
+  const body = {
+    key: PARTNER_PROJECT_KEY,
+    name: 'MAX Platform',
+    projectTypeKey: 'software',
+    assigneeType: 'PROJECT_LEAD',
+    leadAccountId: me.accountId
+  };
+  const res = _jiraFetch(`${base}/project`, {
+    method:'post',
+    headers,
+    contentType:'application/json; charset=utf-8',
+    payload: JSON.stringify(body)
+  });
+  if (res.getResponseCode() >= 200 && res.getResponseCode() < 300) {
+    Logger.log(`[ensure] created partner project ${PARTNER_PROJECT_KEY}`);
+  } else {
+    Logger.log(`[create project] failed ${res.getResponseCode()}: ${res.getContentText()}`);
+  }
+}
+
+/*************** Mirroring (Internal → Partner) ***************/
+function Mirror_Internal_To_Partner() {
+  _mirrorInternalToPartner(/*lastNDays*/90);
+}
+function Mirror_Internal_To_Partner_AllHistory() {
+  _mirrorInternalToPartner(null);
+}
+
+function _mirrorInternalToPartner(lastNDays) {
+  const dateFilter = lastNDays ? ` AND updated >= -${Math.max(1,lastNDays)}d` : '';
+  const jql = `project = ${INTERNAL_PROJECT_KEY}${dateFilter} ORDER BY updated DESC`;
+  const fields = ['summary','description','issuetype','status','project','updated'];
+  const issues = _searchEnhanced('internal', jql, fields);
+  Logger.log(`[mirror] internal ${INTERNAL_PROJECT_KEY}: ${issues.length} issues${lastNDays?` (last ${lastNDays}d)`:''}`);
+
+  const defaultType = _getPartnerDefaultIssueTypeName(PARTNER_PROJECT_KEY) || 'Task';
+  issues.forEach((it) => {
+    try {
+      _createTwinIfMissing(it, defaultType);
+    } catch (e) {
+      Logger.log(`Error on ${it.key}: ${e && e.message ? e.message : e}`);
+    }
+  });
+}
+
+function _getPartnerDefaultIssueTypeName(projectKey) {
+  const { base, headers } = _creds('partner');
+  const res = _jiraFetch(`${base}/issue/createmeta?projectKeys=${encodeURIComponent(projectKey)}&expand=projects.issuetypes.fields`, {
+    method:'get', headers
+  });
+  if (res.getResponseCode() !== 200) return null;
+  const j = JSON.parse(res.getContentText() || '{}');
+  const p = (j.projects || [])[0];
+  const name = p && p.issuetypes && p.issuetypes[0] && p.issuetypes[0].name;
+  return name || null;
+}
+
+function _createTwinIfMissing(srcIssue, defaultTypeName) {
+  const twin = _findExistingTwinOnPartner(srcIssue.key);
+  if (twin) return; // already mirrored
+  _createOnPartner(srcIssue, defaultTypeName);
+}
+
+function _findExistingTwinOnPartner(sourceKey) {
+  // We tag partner summary like: "[MP-123] Original summary"
+  const tag = _summaryTag(sourceKey);                     // e.g. "[MP-123]"
+  const lit = _jqlContainsLiteral(tag);                   // -> "\u005BMP-123\u005D"
+  const jql = `project = ${PARTNER_PROJECT_KEY} AND summary ~ "${lit}"`;
+  const hits = _searchEnhanced('partner', jql, ['summary']);
+  return hits && hits[0] ? hits[0] : null;
+}
+
+function _createOnPartner(srcIssue, defaultTypeName) {
+  const { base:baseP, headers:hdrP } = _creds('partner');
+
+  const srcKey    = srcIssue.key;
+  const srcFields = srcIssue.fields || {};
+  const origSum   = String(srcFields.summary || '(no summary)');
+  const newSummary = `[${srcKey}] ${origSum}`.slice(0, 250); // safe length
+
+  // Description: use ADF if present; wrap plain text to ADF
+  let desc = srcFields.description;
+  if (!desc) {
+    desc = _toADF('');
+  } else if (typeof desc === 'string') {
+    desc = _toADF(desc);
+  }
+
+  const createBody = {
+    fields: {
+      project: { key: PARTNER_PROJECT_KEY },
+      issuetype: { name: defaultTypeName || 'Task' },
+      summary: newSummary,
+      description: desc
+      // keep payload minimal to bypass screen constraints
+    }
+  };
+
+  const res = _jiraFetch(`${baseP}/issue`, {
+    method:'post',
+    headers: hdrP,
+    contentType:'application/json; charset=utf-8',
+    payload: JSON.stringify(createBody)
+  });
+  const created = _jsonOrDie(res, 'create issue');
+
+  // Remote link back to internal
+  const internalUrl = `https://${INTERNAL.SITE}/browse/${srcKey}`;
+  const linkBody = { object: { url: internalUrl, title: srcKey } };
+  const resLink = _jiraFetch(`${baseP}/issue/${encodeURIComponent(created.key)}/remotelink`, {
+    method:'post',
+    headers: hdrP,
+    contentType:'application/json; charset=utf-8',
+    payload: JSON.stringify(linkBody)
+  });
+  _jsonOrDie(resLink, 'create remotelink');
+
+  Logger.log(`[create] ${srcKey} -> ${created.key}`);
+}
