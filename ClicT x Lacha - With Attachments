@@ -1,0 +1,348 @@
+/*************************************************
+ * MAXX — Latcha → Ready2Ride Marketing (MP → MP)
+ * One-way mirroring with attachments (no comments/status yet)
+ **************************************************/
+
+/*** 0) HARDCODED CREDS & PROJECT KEYS ***/
+// INTERNAL (Latcha)
+const INTERNAL = {
+  SITE : 'latcha.atlassian.net',
+  EMAIL: 'indira.r@clictechnologies.com',
+  TOKEN: ''
+};
+// PARTNER (Ready2Ride Marketing)
+const PARTNER = {
+  SITE : 'ready2ridemobile-marketing.atlassian.net',
+  EMAIL: 'marketing@ready2ridemobile.com',
+  TOKEN: ''
+};
+
+// Map internal project → partner project
+const PROJECT_MAP = { 'MP': 'MP' };
+
+// Fetch size and lookback
+const LOOKBACK_DAYS = 90;
+const PAGE_SIZE     = 100;
+
+// Local mirror registry (Script Properties key)
+const MAP_PROP_KEY  = 'MIRROR_MAP_MP'; // internalKey → partnerKey
+
+/************* CORE HELPERS *************/
+function _basicHeaders(email, token) {
+  const b64 = Utilities.base64Encode(email + ':' + token);
+  return {
+    Authorization: 'Basic ' + b64,
+    Accept: 'application/json',
+  };
+}
+function _jsonHeaders(email, token){
+  return { ..._basicHeaders(email, token), 'Content-Type': 'application/json' };
+}
+function _base(site) { return `https://${site}/rest/api/3`; }
+
+function _fetchWithRetry(url, opts = {}, max = 5) {
+  let attempt = 0, wait = 500;
+  while (true) {
+    attempt++;
+    const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true, validateHttpsCertificates: true, ...opts });
+    const code = res.getResponseCode();
+    if ((code >= 200 && code < 300) || (code >= 400 && code < 500 && code !== 429)) return res;
+    if (attempt >= max) return res;
+
+    let ra = 0;
+    try { ra = Number((res.getAllHeaders()||{})['Retry-After']) * 1000 || 0; } catch(_) {}
+    Utilities.sleep(ra || wait); wait = Math.min(wait*2, 8000);
+  }
+}
+function _jsonOrDie(res, label) {
+  const code = res.getResponseCode();
+  const txt  = res.getContentText();
+  if (code < 200 || code >= 300) throw new Error(`${label} failed ${code}: ${txt}`);
+  try { return JSON.parse(txt || '{}'); } catch (e) { throw new Error(`${label} invalid JSON: ${e}`); }
+}
+function _safeJson(txt){ try { return JSON.parse(txt); } catch(_) { return null; } }
+
+/************* WHOAMI / PROJECTS *************/
+function Setup_Sanity() {
+  // internal
+  {
+    const res = _fetchWithRetry(`${_base(INTERNAL.SITE)}/myself`, { method: 'get', headers: _basicHeaders(INTERNAL.EMAIL, INTERNAL.TOKEN) });
+    const me  = _jsonOrDie(res, 'internal myself');
+    Logger.log(`[internal] ${me.displayName} ${me.accountId}`);
+  }
+  // partner
+  {
+    const res = _fetchWithRetry(`${_base(PARTNER.SITE)}/myself`, { method: 'get', headers: _basicHeaders(PARTNER.EMAIL, PARTNER.TOKEN) });
+    const me  = _jsonOrDie(res, 'partner myself');
+    Logger.log(`[partner] ${me.displayName} ${me.accountId}`);
+  }
+  // list a few projects each side
+  ['internal','partner'].forEach(side => {
+    const C = (side === 'internal') ? INTERNAL : PARTNER;
+    const res = _fetchWithRetry(`${_base(C.SITE)}/project/search?expand=lead&maxResults=50`, { method: 'get', headers: _basicHeaders(C.EMAIL, C.TOKEN) });
+    const j = _jsonOrDie(res, `${side} project/search`);
+    const rows = (j.values||[]).map(p => ({ id:p.id, key:p.key, name:p.name, style:p.style || 'unknown' }));
+    Logger.log(`[${side}] projects: ${JSON.stringify(rows, null, 2)}`);
+  });
+  Logger.log('Run Ensure_Target_Project_MP() if the partner is missing MP.');
+}
+
+/** Create partner project MP if missing (uses partner whoami as lead) */
+function Ensure_Target_Project_MP() {
+  const partnerHasMP = _projectExistsOnPartner('MP');
+  if (partnerHasMP) { Logger.log('[ensure] partner already has MP'); return; }
+
+  const me = _jsonOrDie(_fetchWithRetry(`${_base(PARTNER.SITE)}/myself`, { method:'get', headers:_basicHeaders(PARTNER.EMAIL, PARTNER.TOKEN) }), 'partner myself');
+  const payload = {
+    key: 'MP',
+    name: 'MAX Platform',
+    projectTypeKey: 'software',
+    leadAccountId: me.accountId,
+    // template key helps ensure software project
+    projectTemplateKey: 'com.pyxis.greenhopper.jira:gh-simplified-scrum'
+  };
+  const res = _fetchWithRetry(`${_base(PARTNER.SITE)}/project`, {
+    method: 'post',
+    headers: _jsonHeaders(PARTNER.EMAIL, PARTNER.TOKEN),
+    payload: JSON.stringify(payload)
+  });
+  if (res.getResponseCode() >= 300) {
+    Logger.log(`[create project] failed ${res.getResponseCode()}: ${res.getContentText()}`);
+  } else {
+    const p = _jsonOrDie(res, 'create project');
+    Logger.log(`[create project] OK: ${p.key} (${p.id})`);
+  }
+}
+function _projectExistsOnPartner(key){
+  const res = _fetchWithRetry(`${_base(PARTNER.SITE)}/project/search?query=${encodeURIComponent(key)}`, { method:'get', headers:_basicHeaders(PARTNER.EMAIL, PARTNER.TOKEN) });
+  const j = _jsonOrDie(res, 'partner project/search');
+  return (j.values||[]).some(p => p.key === key);
+}
+
+/************* MIRROR (INTERNAL → PARTNER) *************/
+function Mirror_Internal_To_Partner() {
+  const internalKey = 'MP';
+  const partnerKey  = PROJECT_MAP[internalKey];
+  if (!partnerKey) throw new Error(`No partner mapping for internal project ${internalKey}.`);
+
+  // sanity: partner must have target project
+  if (!_projectExistsOnPartner(partnerKey)) {
+    Logger.log(`[mirror] partner is missing ${partnerKey}. Run Ensure_Target_Project_MP() first.`);
+    return;
+  }
+
+  // Partner issue type list for target project (choose a safe default)
+  const partnerTypes = _getPartnerIssueTypes(partnerKey); // e.g., ['Task','Bug','Story',...]
+  Logger.log(`[mirror] partner ${partnerKey} issue types: ${partnerTypes.join(', ')}`);
+
+  const lookback = `-${LOOKBACK_DAYS}d`;
+  const jql = `project = ${internalKey} AND updated >= ${lookback} ORDER BY updated DESC`;
+  const fields = ['summary','issuetype','description','attachment','created','updated','priority','labels','duedate','reporter','assignee','status'];
+  const srcIssues = _searchByJql_Post(INTERNAL, jql, fields);
+  Logger.log(`[mirror] internal ${internalKey}: ${srcIssues.length} issues (last ${LOOKBACK_DAYS}d)`);
+
+  const map = _loadMap();
+
+  for (const it of srcIssues) {
+    const k = it.key;
+    try {
+      let twinKey = map[k];
+
+      if (twinKey) {
+        // Make sure it still exists; if not, clear mapping
+        const probe = UrlFetchApp.fetch(`${_base(PARTNER.SITE)}/issue/${encodeURIComponent(twinKey)}?fields=summary`, {
+          method:'get', headers:_basicHeaders(PARTNER.EMAIL, PARTNER.TOKEN), muteHttpExceptions:true
+        });
+        if (probe.getResponseCode() === 404) {
+          delete map[k]; twinKey = null;
+        }
+      }
+
+      if (!twinKey) {
+        twinKey = _createOnPartner(it, partnerKey, partnerTypes);
+        if (twinKey) {
+          map[k] = twinKey; _saveMap(map);
+          _addRemoteLink(twinKey, `https://${INTERNAL.SITE}/browse/${k}`, k);
+          _copyAllAttachments(k, twinKey); // after creation
+          Logger.log(`[create] ${k} -> ${twinKey}`);
+        }
+      } else {
+        // (Optional) update flow could go here (summary/description sync, etc.)
+      }
+    } catch (err) {
+      Logger.log(`Error on ${k}: ${String(err)}`);
+    }
+  }
+}
+
+/************* SEARCH *************/
+function _searchByJql_Post(CREDS, jql, fieldsArr) {
+  const payload = { jql, fields: fieldsArr, maxResults: PAGE_SIZE };
+  const all = [];
+  let nextPageToken = null;
+
+  while (true) {
+    if (nextPageToken) payload.nextPageToken = nextPageToken;
+    const res = _fetchWithRetry(`${_base(CREDS.SITE)}/search/jql`, {
+      method: 'post',
+      headers: _jsonHeaders(CREDS.EMAIL, CREDS.TOKEN),
+      payload: JSON.stringify(payload)
+    });
+    const body = _jsonOrDie(res, 'search/jql(POST)');
+    const items = body.issues || [];
+    all.push(...items);
+    nextPageToken = body.nextPageToken || null;
+    if (!nextPageToken || items.length === 0) break;
+  }
+  return all;
+}
+
+/************* CREATE ON PARTNER *************/
+function _getPartnerIssueTypes(projectKey){
+  const res = _fetchWithRetry(`${_base(PARTNER.SITE)}/project/${encodeURIComponent(projectKey)}`, {
+    method:'get', headers:_basicHeaders(PARTNER.EMAIL, PARTNER.TOKEN)
+  });
+  const p = _jsonOrDie(res, 'partner project');
+  const types = (p.issueTypes || []).map(t => t.name).filter(Boolean);
+  return types.length ? types : ['Task'];
+}
+function _pickIssueType(sourceName, availableNames){
+  if (!availableNames || !availableNames.length) return 'Task';
+  const prefer = [sourceName, 'Task', 'Bug', 'Story', availableNames[0]].filter(Boolean);
+  for (const name of prefer) {
+    if (availableNames.includes(name)) return name;
+  }
+  return availableNames[0];
+}
+
+// Strongly sanitize description → plain text ADF (no media/cards)
+function _toPlainTextFromADF(adf) {
+  if (!adf) return '';
+  try {
+    // If string already, return it
+    if (typeof adf === 'string') return adf;
+
+    const out = [];
+    const walk = (node) => {
+      if (!node) return;
+      const t = node.type;
+      if (t === 'text') { out.push(node.text || ''); return; }
+      if (t === 'hardBreak') { out.push('\n'); return; }
+      if (Array.isArray(node.content)) node.content.forEach(walk);
+      if (t === 'paragraph' || t === 'heading' || t === 'blockquote' || t === 'codeBlock' || t === 'listItem') out.push('\n');
+      // ignore mediaSingle, media, inlineCard, panel, etc.
+    };
+    if (adf.type === 'doc' && Array.isArray(adf.content)) adf.content.forEach(walk); else walk(adf);
+    const txt = out.join('').replace(/\n{3,}/g, '\n\n').trim();
+    return txt;
+  } catch(_) {
+    return typeof adf === 'string' ? adf : JSON.stringify(adf);
+  }
+}
+function _plainToADFDoc(text) {
+  const safe = String(text || '').replace(/\r/g, '');
+  // Split on double newlines into paragraphs
+  const paras = safe.split(/\n{2,}/).map(p => ({
+    type:'paragraph',
+    content: [{ type:'text', text: p.replace(/\n/g, ' ') }]
+  }));
+  return { type:'doc', version:1, content: paras.length ? paras : [{ type:'paragraph', content: [] }] };
+}
+
+function _createOnPartner(srcIssue, partnerProjectKey, partnerTypeList) {
+  const f = srcIssue.fields || {};
+  const internalKey = srcIssue.key;
+  const summary = `[${internalKey}] ${f.summary || '(no summary)'}`;
+
+  const descPlain = _toPlainTextFromADF(f.description);
+  const descADF   = _plainToADFDoc(descPlain);
+
+  const issueType = _pickIssueType(f.issuetype && f.issuetype.name, partnerTypeList);
+
+  const payload = {
+    fields: {
+      project:  { key: partnerProjectKey },
+      issuetype:{ name: issueType },
+      summary:  summary,
+      description: descADF
+      // DO NOT set labels/priority/duedate on create — can be missing on screen in team-managed projects
+    }
+  };
+
+  const res = _fetchWithRetry(`${_base(PARTNER.SITE)}/issue`, {
+    method: 'post',
+    headers: _jsonHeaders(PARTNER.EMAIL, PARTNER.TOKEN),
+    payload: JSON.stringify(payload)
+  });
+  if (res.getResponseCode() !== 201) throw new Error(`create issue failed ${res.getResponseCode()}: ${res.getContentText()}`);
+  const j = _jsonOrDie(res, 'create issue');
+  return j.key;
+}
+
+/************* ATTACHMENTS COPY *************/
+function _copyAllAttachments(internalKey, partnerKey) {
+  // 1) list internal attachments
+  const res1 = _fetchWithRetry(`${_base(INTERNAL.SITE)}/issue/${encodeURIComponent(internalKey)}?fields=attachment`, {
+    method: 'get', headers: _basicHeaders(INTERNAL.EMAIL, INTERNAL.TOKEN)
+  });
+  const j1 = _jsonOrDie(res1, 'internal issue (attachments)');
+  const atts = ((j1.fields||{}).attachment) || [];
+  if (!atts.length) return;
+
+  for (const a of atts) {
+    try {
+      // Download bytes from internal (auth required)
+      const fileResp = UrlFetchApp.fetch(a.content, { // a.content is a full URL
+        method: 'get',
+        headers: _basicHeaders(INTERNAL.EMAIL, INTERNAL.TOKEN),
+        muteHttpExceptions: true,
+        followRedirects: true,
+        validateHttpsCertificates: true
+      });
+      const code = fileResp.getResponseCode();
+      if (code !== 200) { Logger.log(`  [att] skip ${a.filename}: download ${code}`); continue; }
+
+      const blob = Utilities.newBlob(fileResp.getContent(), a.mimeType || 'application/octet-stream', a.filename || 'file');
+      // Upload to partner
+      const uploadUrl = `${_base(PARTNER.SITE)}/issue/${encodeURIComponent(partnerKey)}/attachments`;
+      const up = UrlFetchApp.fetch(uploadUrl, {
+        method: 'post',
+        headers: { ..._basicHeaders(PARTNER.EMAIL, PARTNER.TOKEN), 'X-Atlassian-Token': 'no-check' },
+        payload: { file: blob },       // let Apps Script compose multipart form-data
+        muteHttpExceptions: true
+      });
+      if (up.getResponseCode() !== 200) {
+        Logger.log(`  [att] upload failed ${a.filename}: ${up.getResponseCode()} ${up.getContentText()}`);
+      } else {
+        Logger.log(`  [att] uploaded ${a.filename}`);
+      }
+    } catch (e) {
+      Logger.log(`  [att] error ${a && a.filename}: ${String(e)}`);
+    }
+  }
+}
+
+/************* REMOTE LINK *************/
+function _addRemoteLink(partnerKey, url, title) {
+  const payload = { object: { url, title: title || url } };
+  const res = _fetchWithRetry(`${_base(PARTNER.SITE)}/issue/${encodeURIComponent(partnerKey)}/remotelink`, {
+    method:'post',
+    headers: _jsonHeaders(PARTNER.EMAIL, PARTNER.TOKEN),
+    payload: JSON.stringify(payload)
+  });
+  if (res.getResponseCode() >= 300) {
+    Logger.log(`[remotelink] ${partnerKey} -> ${url} failed ${res.getResponseCode()}: ${res.getContentText()}`);
+  }
+}
+
+/************* LOCAL MAP (avoid duplicates) *************/
+function _loadMap(){
+  const raw = PropertiesService.getScriptProperties().getProperty(MAP_PROP_KEY);
+  return raw ? _safeJson(raw) || {} : {};
+}
+function _saveMap(map){
+  PropertiesService.getScriptProperties().setProperty(MAP_PROP_KEY, JSON.stringify(map));
+}
+function Dump_Mirror_Map(){ Logger.log(JSON.stringify(_loadMap(), null, 2)); }
+function Clear_Mirror_Map(){ PropertiesService.getScriptProperties().deleteProperty(MAP_PROP_KEY); }
+
