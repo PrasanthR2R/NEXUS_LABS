@@ -1,0 +1,667 @@
+/***********************
+ * Latcha → ClicT Mirror (ONE-WAY ONLY) — Sheet-backed state (logs tab)
+ * Policy: Only Description + Comments update on reruns. Status/Priority/Start/Due set once on create.
+ ***********************/
+
+/**** CONFIG ****/
+const CFG = {
+  // SOURCE (read-only)
+  SOURCE: {
+    SITE:  'latcha.atlassian.net',
+    EMAIL: 'indira.r@clictechnologies.com',
+    TOKEN: '',
+  },
+  // TARGET (write-only)
+  TARGET: {
+    SITE:  'apiready2ride.atlassian.net',
+    EMAIL: 'api.ready2ride@gmail.com',
+    TOKEN: '',
+  },
+
+  // Route SOURCE project → TARGET mirror project (auto-created if missing)
+  TARGET_PROJECTS: {
+    MP: { key: 'LATCHA', name: 'Latcha Mirror (MP)' },
+  },
+
+  // Sheet storage
+  SHEET_ID: '14ScwQOZ1jnbcsTJZ85_HWPVuOKNXMytc0Yuc2M9M1VQ',
+  SHEET_TAB: 'logs',
+
+  // Run controls
+  DRY_RUN: false,
+  PAGE_SIZE: 100,
+  DELTA_BUFFER_MINUTES: 2,          // buffer around last sync (indexing lag)
+  DELTA_BACKSTOP: '-2h',            // fallback window if delta returns 0 (testing-friendly)
+  SOFT_TIME_BUDGET_MS: 250000,
+  JQL_FULL:  'project = MP ORDER BY updated ASC',
+  JQL_DELTA: 'project = MP AND updated >= "{SINCE}" ORDER BY updated ASC',
+
+  // Labels
+  STATUS_LABEL_PREFIX: 'latcha-status:',
+
+  // Update policy
+  POLICY: {
+    SET_UI_ON_CREATE: true,     // priority / start / due
+    SET_UI_ON_UPDATE: false,    // ← freeze after create
+    MATCH_STATUS_ON_CREATE: true,
+    MATCH_STATUS_ON_UPDATE: false, // ← freeze after create
+    OVERWRITE_DESC_ALWAYS: true,
+    SYNC_COMMENTS_ALWAYS: true
+  }
+};
+
+/** ===== SHEET STATE LAYER ===== **/
+const COLS = { Type:0, Key1:1, Key2:2, Key3:3, Value:4, UpdatedAt:5 };
+function sheet_(){ return SpreadsheetApp.openById(CFG.SHEET_ID).getSheetByName(CFG.SHEET_TAB); }
+function nowISO(){ return new Date().toISOString(); }
+
+function stateLoad(){
+  const sh = sheet_();
+  if(!sh){ throw new Error(`Sheet/tab not found: ${CFG.SHEET_ID} / ${CFG.SHEET_TAB}`); }
+  const rng = sh.getDataRange(), values = rng.getValues();
+  if (!values.length || (values[0][0]||'') !== 'Type'){
+    sh.clear(); sh.getRange(1,1,1,6).setValues([['Type','Key1','Key2','Key3','Value','UpdatedAt']]);
+    return { meta:{}, map:new Map(), comm:new Map(), rows:[], dirty:false };
+  }
+  const rows = values.slice(1);
+  const meta = {}; const map = new Map(); const comm = new Map();
+  rows.forEach(r=>{
+    const t=(r[COLS.Type]||'').toString().trim();
+    if(t==='META'){ meta[(r[COLS.Key1]||'').toString()] = (r[COLS.Value]||'').toString(); }
+    if(t==='MAP'){  const lk=(r[COLS.Key1]||'').toString(); const tk=(r[COLS.Value]||r[COLS.Key2]||'').toString(); if(lk&&tk) map.set(lk, tk); }
+    if(t==='COMM'){ const tgt=(r[COLS.Key1]||'').toString(); const srcCid=(r[COLS.Key2]||'').toString(); const tgtCid=(r[COLS.Value]||'').toString(); if(tgt&&srcCid&&tgtCid) comm.set(`${tgt}::${srcCid}`, tgtCid); }
+  });
+  return { meta, map, comm, rows, dirty:false };
+}
+function stateSave(st){
+  if(!st.dirty) return;
+  const sh = sheet_();
+  const out = [['Type','Key1','Key2','Key3','Value','UpdatedAt']];
+  const ts = nowISO();
+  Object.keys(st.meta).forEach(k=> out.push(['META', k, '', '', st.meta[k], ts]));
+  for (const [lk, tk] of st.map.entries()) out.push(['MAP', lk, tk, '', tk, ts]);
+  for (const [compound, tgtCid] of st.comm.entries()){
+    const [tgt, srcCid] = compound.split('::');
+    out.push(['COMM', tgt, srcCid, '', tgtCid, ts]);
+  }
+  sh.clear();
+  sh.getRange(1,1,out.length,out[0].length).setValues(out);
+}
+function metaGet(st, k){ return st.meta[k] || null; }
+function metaSet(st, k, v){ st.meta[k]=v; st.dirty=true; }
+function mapGet(st, latchaKey){ return st.map.get(latchaKey); }
+function mapSet(st, latchaKey, targetKey){ st.map.set(latchaKey, targetKey); st.dirty=true; }
+function commGet(st, targetKey, srcCommentId){ return st.comm.get(`${targetKey}::${srcCommentId}`); }
+function commSet(st, targetKey, srcCommentId, tgtCommentId){ st.comm.set(`${targetKey}::${srcCommentId}`, tgtCommentId); st.dirty=true; }
+
+/** ===== HTTP helpers ===== **/
+function _b64(e, t){ return Utilities.base64Encode(e + ':' + t); }
+function _base(site){ return `https://${site}/rest/api/3`; }
+function _hdrJson(e,t){ return {Authorization:'Basic '+_b64(e,t),'Content-Type':'application/json',Accept:'application/json'}; }
+function _hdrBin(e,t){ return {Authorization:'Basic '+_b64(e,t),Accept:'application/json'}; }
+function _fetch(url,opt={},max=5){
+  let attempt=0, wait=500;
+  for(;;){
+    attempt++;
+    const res = UrlFetchApp.fetch(url, {muteHttpExceptions:true,followRedirects:true,validateHttpsCertificates:true,...opt});
+    const code = res.getResponseCode();
+    if((code>=200&&code<300) || (code>=400&&code<500 && code!==429)) return res;
+    if(attempt>=max) return res;
+    let ra=0; try{ ra = Number((res.getAllHeaders()||{})['Retry-After']||0)*1000 || 0; }catch(e){}
+    Utilities.sleep(ra || wait); wait = Math.min(wait*2, 8000);
+  }
+}
+function _json(res,label){
+  const c=res.getResponseCode(), t=res.getContentText();
+  if(c<200||c>=300) throw new Error(`${label} ${c}: ${t}`);
+  return t ? JSON.parse(t) : {};
+}
+
+/** ===== ADF + text helpers ===== **/
+function a2txt(adf){
+  try{
+    if(!adf) return '';
+    if(typeof adf==='string') return adf;
+    const out=[];
+    (function walk(n){
+      if(!n) return;
+      if(n.type==='text'){ out.push(n.text||''); return; }
+      if(n.type==='hardBreak'){ out.push('\n'); return; }
+      (n.content||[]).forEach(walk);
+      if(['paragraph','heading','blockquote','codeBlock','listItem'].includes(n.type)) out.push('\n');
+    })(adf.type==='doc'?{content:adf.content}:adf);
+    return out.join('').replace(/\n{3,}/g,'\n\n').trim();
+  }catch(_){ return typeof adf==='string'?adf:JSON.stringify(adf); }
+}
+function para(text){ return {type:'paragraph', content: text ? [{type:'text', text}] : []}; }
+function paraEm(text){ return {type:'paragraph', content: text ? [{type:'text', text, marks:[{type:'em'}]}] : []}; }
+function hardBreak(){ return {type:'paragraph', content:[]}; }
+function toUtcDisplay(dISO){
+  if(!dISO) return '—';
+  if(/^\d{4}-\d{2}-\d{2}$/.test(dISO)) return dISO + ' 00:00:00 UTC';
+  return dISO.replace('T',' ').replace(/\..+/, '') + ' UTC';
+}
+function onlyDate(iso){
+  if(!iso) return null;
+  if(/^\d{4}-\d{2}-\d{2}$/.test(iso)) return iso;
+  const d = new Date(iso); if(isNaN(d)) return null;
+  const y=d.getUTCFullYear(), m=String(d.getUTCMonth()+1).padStart(2,'0'), dd=String(d.getUTCDate()).padStart(2,'0');
+  return `${y}-${m}-${dd}`;
+}
+// NEW: JQL-friendly datetime (no T/Z)
+function toJqlDateTime(iso){
+  const d = new Date(iso);
+  const y=d.getUTCFullYear(), m=String(d.getUTCMonth()+1).padStart(2,'0'), dd=String(d.getUTCDate()).padStart(2,'0');
+  const hh=String(d.getUTCHours()).padStart(2,'0'), mm=String(d.getUTCMinutes()).padStart(2,'0');
+  return `${y}-${m}-${dd} ${hh}:${mm}`;
+}
+
+/** ===== Field discovery (Start Date + Priority mapping) ===== **/
+function discoverStartDateFieldId(site, email, token, metaKey, st){
+  const cached = metaGet(st, metaKey);
+  if (cached) return cached;
+  const res = _fetch(`${_base(site)}/field`, { method:'get', headers:_hdrBin(email, token) });
+  const fields = _json(res, 'fields');
+  const hit = (fields || []).find(f => (f.name||'').toLowerCase() === 'start date');
+  const id = hit && hit.id;
+  if (id) metaSet(st, metaKey, id);
+  return id || null;
+}
+function cacheTargetPriorityMap(st){
+  const cacheKey = 'TGT_PRIORITY_MAP_JSON';
+  const cached = metaGet(st, cacheKey);
+  if (cached) try { return JSON.parse(cached); } catch(_) {}
+  const r = _fetch(`${_base(CFG.TARGET.SITE)}/priority`, { method:'get', headers:_hdrBin(CFG.TARGET.EMAIL,CFG.TARGET.TOKEN) });
+  const arr = _json(r,'target priorities');
+  const map = {};
+  (arr||[]).forEach(p => { if(p && p.name && p.id) map[p.name.toLowerCase()] = p.id; });
+  metaSet(st, cacheKey, JSON.stringify(map));
+  return map;
+}
+
+/** ===== Search (POST with nextPageToken) ===== **/
+function sourceSearchEnhanced(jql, fieldsArr){
+  const body = { jql, fields:fieldsArr, maxResults:CFG.PAGE_SIZE };
+  let next=null, all=[];
+  do{
+    if(next) body.nextPageToken = next;
+    const res=_fetch(`${_base(CFG.SOURCE.SITE)}/search/jql`, { method:'post', headers:_hdrJson(CFG.SOURCE.EMAIL, CFG.SOURCE.TOKEN), payload:JSON.stringify(body) });
+    const j=_json(res,'source search');
+    all = all.concat(j.issues || []);
+    next = j.nextPageToken || null;
+  }while(next);
+  return all;
+}
+
+/** ===== Target project ensure/create ===== **/
+function ensureTargetProjectExists(sourceProjectKey){
+  const meta = CFG.TARGET_PROJECTS[sourceProjectKey];
+  if(!meta){ throw new Error(`No TARGET mapping for source ${sourceProjectKey}`); }
+  const key = meta.key; const name = meta.name || key;
+
+  const sr = _fetch(`${_base(CFG.TARGET.SITE)}/project/search?query=${encodeURIComponent(key)}`, { method:'get', headers:_hdrBin(CFG.TARGET.EMAIL, CFG.TARGET.TOKEN) });
+  const sj = _json(sr, 'target project/search');
+  if((sj.values||[]).some(p=>p.key===key)){ _log(`[PROJECT] target has ${key}`); return key; }
+
+  const me = _json(_fetch(`${_base(CFG.TARGET.SITE)}/myself`, { method:'get', headers:_hdrBin(CFG.TARGET.EMAIL, CFG.TARGET.TOKEN) }), 'target myself');
+
+  const templates = [
+    { projectTypeKey: 'software', projectTemplateKey: 'com.pyxis.greenhopper.jira-software:software-development-simplified' },
+    { projectTypeKey: 'software', projectTemplateKey: 'com.pyxis.greenhopper.jira:gh-simplified-scrum' },
+    { projectTypeKey: 'software', projectTemplateKey: 'com.pyxis.greenhopper.jira:gh-simplified-kanban' },
+    { projectTypeKey: 'software', projectTemplateKey: 'com.pyxis.greenhopper.jira:software-development' },
+    { projectTypeKey: 'business', projectTemplateKey: 'com.atlassian.jira-core-project-templates:jira-core-project-management' }
+  ];
+
+  let lastErr = null;
+  for (const t of templates){
+    const payload = { key, name, projectTypeKey: t.projectTypeKey, projectTemplateKey: t.projectTemplateKey, leadAccountId: me.accountId };
+    _log(`[PROJECT] creating ${key} "${name}" via ${t.projectTemplateKey}`);
+    const cr = _fetch(`${_base(CFG.TARGET.SITE)}/project`, { method:'post', headers:_hdrJson(CFG.TARGET.EMAIL,CFG.TARGET.TOKEN), payload: JSON.stringify(payload) });
+    const code = cr.getResponseCode();
+    if (code >= 200 && code < 300){
+      const pj = _json(cr, 'create project');
+      _log(`[PROJECT] created ${pj.key} (${pj.id})`);
+      return pj.key;
+    } else {
+      lastErr = `(${code}) ${cr.getContentText()}`;
+    }
+  }
+  throw new Error(`Unable to create project ${key}. Last error: ${lastErr || 'unknown'}`);
+}
+
+/** ===== Build description (raw desc + italic facts) ===== **/
+function buildFullSyncedDescriptionADF(f){
+  const descTxt   = (a2txt(f.description) || '').trim() || '(no description on Latcha)';
+  const status    = (f.status && f.status.name) || '—';
+  const lastUpd   = toUtcDisplay(f.updated || f.created || nowISO());
+  const assignee  = (f.assignee && f.assignee.displayName) ? f.assignee.displayName : '—';
+  const reporter  = (f.reporter && f.reporter.displayName) ? f.reporter.displayName : '—';
+  const due       = f.duedate || '—';
+  const priority  = (f.priority && f.priority.name) ? f.priority.name : '—';
+  const start     = f.__startDateMirror || '—';
+
+  const doc = { type:'doc', version:1, content: [] };
+
+  // raw description paragraphs
+  String(descTxt).split(/\n{2,}/).forEach(p => doc.content.push(para(p.replace(/\n/g,' '))));
+
+  // two blank lines
+  doc.content.push(hardBreak());
+  doc.content.push(hardBreak());
+
+  // italic facts (minimal)
+  doc.content.push(paraEm(`From Latcha · Last updated: ${lastUpd}`));
+  doc.content.push(paraEm(`Latcha status: ${status}`));
+  doc.content.push(hardBreak());
+  doc.content.push(paraEm(`Priority (Latcha):  ${priority}`));
+  doc.content.push(paraEm(`Start date (Latcha): ${start}`));
+  doc.content.push(paraEm(`Due date (Latcha):   ${due}`));
+  doc.content.push(hardBreak());
+  doc.content.push(paraEm(`Assignee (Latcha):   ${assignee}`));
+  doc.content.push(paraEm(`Reporter (Latcha):   ${reporter}`));
+
+  return doc;
+}
+
+/** ===== Issue creation / update on TARGET ===== **/
+function ensureIssueOnTarget(srcIssue, st){
+  const sk = srcIssue.key, f = srcIssue.fields || {};
+  const srcProj = (f.project && f.project.key) || sk.split('-')[0];
+  const targetProjectKey = ensureTargetProjectExists(srcProj);
+
+  let tk = mapGet(st, sk);
+  let createdNow = false;
+
+  if(!tk){
+    // stash Start date for description facts
+    const srcStartId = discoverStartDateFieldId(CFG.SOURCE.SITE, CFG.SOURCE.EMAIL, CFG.SOURCE.TOKEN, 'SRC_START_FIELD', st);
+    f.__startDateMirror = (srcStartId && f[srcStartId]) ? String(f[srcStartId]) : '—';
+
+    const fullADF = buildFullSyncedDescriptionADF(f);
+    const payload = {
+      fields:{
+        project:{ key: targetProjectKey },
+        issuetype:{ name: (f.issuetype && f.issuetype.name) || 'Task' },
+        summary:`[${sk}] ${f.summary || '(no summary)'}`,
+        description: fullADF
+      }
+    };
+    _log(`[CREATE] ${sk} → ${targetProjectKey}`, payload.fields.summary);
+    const res=_fetch(`${_base(CFG.TARGET.SITE)}/issue`, {method:'post',headers:_hdrJson(CFG.TARGET.EMAIL,CFG.TARGET.TOKEN),payload:JSON.stringify(payload)});
+    const j=_json(res,'create target issue');
+    tk = j.key;
+    mapSet(st, sk, tk);
+    addRemoteLink(tk, `https://${CFG.SOURCE.SITE}/browse/${sk}`, sk);
+
+    // One-time: status + UI fields
+    if (CFG.POLICY.MATCH_STATUS_ON_CREATE) {
+      const latchaStatus = (f.status && f.status.name) || '';
+      ensureStatusSync(tk, latchaStatus);
+    }
+    if (CFG.POLICY.SET_UI_ON_CREATE) {
+      updateTargetUIFields(tk, f, st);
+    }
+
+    createdNow = true;
+  }
+
+  return { key: tk, created: createdNow };
+}
+
+function updateDescriptionOnTargetWithADF(targetKey, f, st){
+  const srcStartId = discoverStartDateFieldId(CFG.SOURCE.SITE, CFG.SOURCE.EMAIL, CFG.SOURCE.TOKEN, 'SRC_START_FIELD', st);
+  f.__startDateMirror = (srcStartId && f[srcStartId]) ? String(f[srcStartId]) : '—';
+
+  const fullADF = buildFullSyncedDescriptionADF(f);
+  _log(`[DESC] ${targetKey} overwrite description`);
+  const put=_fetch(`${_base(CFG.TARGET.SITE)}/issue/${encodeURIComponent(targetKey)}`, {
+    method:'put', headers:_hdrJson(CFG.TARGET.EMAIL,CFG.TARGET.TOKEN), payload:JSON.stringify({fields:{description: fullADF}})
+  });
+  if(put.getResponseCode()>=300) Logger.log(put.getContentText());
+}
+
+function addRemoteLink(targetKey, url, title){
+  const payload = { object:{ url, title: title || url } };
+  _log(`[LINK] ${targetKey} ← ${url}`);
+  const res=_fetch(`${_base(CFG.TARGET.SITE)}/issue/${encodeURIComponent(targetKey)}/remotelink`, {
+    method:'post', headers:_hdrJson(CFG.TARGET.EMAIL,CFG.TARGET.TOKEN), payload:JSON.stringify(payload)
+  });
+  if(res.getResponseCode()>=300) Logger.log(res.getContentText());
+}
+
+/** ===== Attachments (add new only) ===== **/
+function syncAttachments(sourceKey, targetKey){
+  const lr=_fetch(`${_base(CFG.SOURCE.SITE)}/issue/${encodeURIComponent(sourceKey)}?fields=attachment`, {method:'get',headers:_hdrBin(CFG.SOURCE.EMAIL,CFG.SOURCE.TOKEN)});
+  const lj=_json(lr,'source attachments'); const latts=((lj.fields||{}).attachment)||[];
+
+  const tr=_fetch(`${_base(CFG.TARGET.SITE)}/issue/${encodeURIComponent(targetKey)}?fields=attachment`, {method:'get',headers:_hdrBin(CFG.TARGET.EMAIL,CFG.TARGET.TOKEN)});
+  const tj=_json(tr,'target attachments'); const tatts=((tj.fields||{}).attachment)||[];
+
+  const existing = new Set(tatts.map(a => (a.filename||'')+':'+(a.size||0)));
+
+  for(const a of latts){
+    const sig = (a.filename||'')+':'+(a.size||0);
+    if(existing.has(sig)) continue;
+    const fileResp = UrlFetchApp.fetch(a.content, {method:'get', headers:_hdrBin(CFG.SOURCE.EMAIL,CFG.SOURCE.TOKEN), muteHttpExceptions:true, followRedirects:true, validateHttpsCertificates:true});
+    if(fileResp.getResponseCode()!==200){ Logger.log(`  [att] skip ${a.filename}: ${fileResp.getResponseCode()}`); continue; }
+    const blob = Utilities.newBlob(fileResp.getContent(), a.mimeType||'application/octet-stream', a.filename||'file');
+    const up = _fetch(`${_base(CFG.TARGET.SITE)}/issue/${encodeURIComponent(targetKey)}/attachments`, {
+      method:'post', headers:{..._hdrBin(CFG.TARGET.EMAIL,CFG.TARGET.TOKEN),'X-Atlassian-Token':'no-check'}, payload:{file:blob}
+    });
+    if(up.getResponseCode()>=300) Logger.log(`  [att] upload failed ${a.filename}: ${up.getResponseCode()} ${up.getContentText()}`);
+  }
+}
+
+/** ===== Comments (one-way, paginated, new format, de-dup, edit-aware) ===== **/
+function buildCommentADF(bodyTxt, authorName, whenISO){
+  const quote = `“${(bodyTxt||'').replace(/"/g,"'")}”`;
+  const byline = `By ${authorName || 'Latcha user'} · ${toUtcDisplay(whenISO)}`;
+  return { type:'doc', version:1, content:[ para(quote), paraEm(byline) ] };
+}
+function listAllSourceComments(sourceKey){
+  let startAt=0, out=[];
+  for(;;){
+    const r=_fetch(`${_base(CFG.SOURCE.SITE)}/issue/${encodeURIComponent(sourceKey)}/comment?orderBy=created&startAt=${startAt}&maxResults=50`, {method:'get',headers:_hdrBin(CFG.SOURCE.EMAIL,CFG.SOURCE.TOKEN)});
+    const j=_json(r,'source comments');
+    out = out.concat(j.comments||[]);
+    if (j.startAt + j.maxResults >= j.total) break;
+    startAt += j.maxResults;
+  }
+  return out;
+}
+function listAllTargetComments(targetKey){
+  let startAt=0, out=[];
+  for(;;){
+    const r=_fetch(`${_base(CFG.TARGET.SITE)}/issue/${encodeURIComponent(targetKey)}/comment?startAt=${startAt}&maxResults=50`, {method:'get',headers:_hdrBin(CFG.TARGET.EMAIL,CFG.TARGET.TOKEN)});
+    const j=_json(r,'target comments');
+    out = out.concat(j.comments||[]);
+    if (j.startAt + j.maxResults >= j.total) break;
+    startAt += j.maxResults;
+  }
+  return out;
+}
+function topPlainFromADF(adf){
+  try{
+    const c = adf && adf.content && adf.content[0] && adf.content[0].content && adf.content[0].content[0];
+    return (c && c.text) || '';
+  }catch(_){ return ''; }
+}
+function syncComments(sourceKey, targetKey, st){
+  const items = listAllSourceComments(sourceKey);
+  const titems = listAllTargetComments(targetKey);
+  const tIdx = new Map(titems.map(x=>[x.id,x]));
+
+  let created=0, updated=0;
+
+  for(const it of items){
+    const lid=it.id;
+    const existingTid = commGet(st, targetKey, lid);
+    const bodyTxt=(a2txt(it.body) || '').trim();
+    const author=(it.author&&it.author.displayName)||'Latcha user';
+    const whenISO = (it.updated || it.created || '');
+
+    const bodyADF = buildCommentADF(bodyTxt, author, whenISO);
+    const expectedPlainTop = `“${(bodyTxt||'').replace(/"/g,"'")}”`;
+
+    if(!existingTid){
+      _log(`[COMM+] ${sourceKey} → ${targetKey} by ${author}`);
+      const res=_fetch(`${_base(CFG.TARGET.SITE)}/issue/${encodeURIComponent(targetKey)}/comment`, {
+        method:'post', headers:_hdrJson(CFG.TARGET.EMAIL,CFG.TARGET.TOKEN), payload:JSON.stringify({ body: bodyADF })
+      });
+      const j=_json(res,'add target comment');
+      commSet(st, targetKey, lid, j.id);
+      created++;
+    }else{
+      const existing = tIdx.get(existingTid);
+      if(existing){
+        const existingTxtTop = topPlainFromADF(existing.body);
+        if(existingTxtTop !== expectedPlainTop){
+          _log(`[COMM~] ${sourceKey} → ${targetKey} update by ${author}`);
+          _fetch(`${_base(CFG.TARGET.SITE)}/issue/${encodeURIComponent(targetKey)}/comment/${existingTid}`, {
+            method:'put', headers:_hdrJson(CFG.TARGET.EMAIL,CFG.TARGET.TOKEN), payload:JSON.stringify({ body: bodyADF })
+          });
+          updated++;
+        }
+      }else{
+        // mapping exists but comment was deleted on target → recreate
+        const res=_fetch(`${_base(CFG.TARGET.SITE)}/issue/${encodeURIComponent(targetKey)}/comment`, {
+          method:'post', headers:_hdrJson(CFG.TARGET.EMAIL,CFG.TARGET.TOKEN), payload:JSON.stringify({ body: bodyADF })
+        });
+        const j=_json(res,'re-add target comment');
+        commSet(st, targetKey, lid, j.id);
+        created++;
+      }
+    }
+  }
+  return {created, updated};
+}
+
+/** ===== Status sync (one-way on create only) ===== **/
+const STATUS_NAME_MAP = {
+  'to do': 'To Do',
+  'in progress': 'In Progress',
+  'in-progress': 'In Progress',
+  'doing': 'In Progress',
+  'selected for development': 'In Progress',
+  'done': 'Done',
+  'completed': 'Done'
+};
+function normalizeStatusName(name){
+  if(!name) return '';
+  const n = String(name).trim().toLowerCase();
+  return STATUS_NAME_MAP[n] || name;
+}
+function getTargetIssueStatus(targetKey){
+  const r = _fetch(`${_base(CFG.TARGET.SITE)}/issue/${encodeURIComponent(targetKey)}?fields=status`, {
+    method:'get', headers:_hdrBin(CFG.TARGET.EMAIL, CFG.TARGET.TOKEN)
+  });
+  const j = _json(r, 'get target status');
+  return (j.fields && j.fields.status && j.fields.status.name) || '';
+}
+function listTransitions(targetKey){
+  const r = _fetch(`${_base(CFG.TARGET.SITE)}/issue/${encodeURIComponent(targetKey)}/transitions`, {
+    method:'get', headers:_hdrBin(CFG.TARGET.EMAIL, CFG.TARGET.TOKEN)
+  });
+  const j = _json(r, 'list transitions');
+  return j.transitions || [];
+}
+function transitionIssue(targetKey, transitionId){
+  const r = _fetch(`${_base(CFG.TARGET.SITE)}/issue/${encodeURIComponent(targetKey)}/transitions`, {
+    method:'post',
+    headers:_hdrJson(CFG.TARGET.EMAIL, CFG.TARGET.TOKEN),
+    payload: JSON.stringify({ transition: { id: String(transitionId) } })
+  });
+  if (r.getResponseCode() >= 300) {
+    Logger.log(`[TRANSITION] ${targetKey} failed: ${r.getResponseCode()} ${r.getContentText()}`);
+    return false;
+  }
+  return true;
+}
+function ensureStatusSync(targetKey, latchaStatus){
+  if(!latchaStatus) return;
+  const want = normalizeStatusName(latchaStatus);
+  const cur  = getTargetIssueStatus(targetKey);
+  if(!want || !cur) return;
+  if (cur.toLowerCase() === want.toLowerCase()) return;
+  const transitions = listTransitions(targetKey);
+  let pick = transitions.find(t => (t.to && t.to.name && t.to.name.toLowerCase() === want.toLowerCase()));
+  if(!pick && want.toLowerCase() === 'in progress'){
+    pick = transitions.find(t => String(t.name||'').toLowerCase().includes('progress') || (t.to && String(t.to.name||'').toLowerCase().includes('progress')));
+  }
+  if(pick) transitionIssue(targetKey, pick.id);
+}
+
+/** ===== Labels for status mismatch (non-invasive; allowed on updates) ===== **/
+function ensureStatusLabel(targetKey, latchaStatus){
+  const gr=_fetch(`${_base(CFG.TARGET.SITE)}/issue/${encodeURIComponent(targetKey)}?fields=status,labels,description`, {method:'get',headers:_hdrBin(CFG.TARGET.EMAIL,CFG.TARGET.TOKEN)});
+  const gf=_json(gr,'get target issue').fields||{};
+  const localStatus = (gf.status && gf.status.name) || '';
+  const wantLabel   = CFG.STATUS_LABEL_PREFIX + (String(latchaStatus||'').toLowerCase().replace(/\s+/g,'-'));
+  const labels = new Set((gf.labels||[]).filter(l=>!l.startsWith(CFG.STATUS_LABEL_PREFIX)));
+  if(localStatus && latchaStatus && localStatus.toLowerCase() !== String(latchaStatus).toLowerCase()){
+    labels.add(wantLabel);
+  }
+  const arr=[...labels];
+  const payload={ update:{ labels:[{set:arr}] }, fields:{ description: gf.description } };
+  _fetch(`${_base(CFG.TARGET.SITE)}/issue/${encodeURIComponent(targetKey)}`, {
+    method:'put', headers:_hdrJson(CFG.TARGET.EMAIL,CFG.TARGET.TOKEN), payload:JSON.stringify(payload)
+  });
+}
+
+/** ===== Target UI fields (Priority/Start/Due) [create only] ===== **/
+function updateTargetUIFields(targetKey, f, st){
+  const fields = {};
+
+  // Priority — map by name to target ID
+  if (f.priority && f.priority.name){
+    const tgtMap = cacheTargetPriorityMap(st);
+    const id = tgtMap[(f.priority.name||'').toLowerCase()] || null;
+    if (id) fields.priority = { id };
+    else    fields.priority = { name: f.priority.name }; // fallback
+  }
+
+  // Due date — coerce to YYYY-MM-DD
+  if (f.duedate){
+    const d = onlyDate(f.duedate);
+    if(d) fields.duedate = d;
+  }
+
+  // Start date (custom)
+  const srcStartFieldId = discoverStartDateFieldId(CFG.SOURCE.SITE, CFG.SOURCE.EMAIL, CFG.SOURCE.TOKEN, 'SRC_START_FIELD', st);
+  const tgtStartFieldId = discoverStartDateFieldId(CFG.TARGET.SITE, CFG.TARGET.EMAIL, CFG.TARGET.TOKEN, 'TGT_START_FIELD', st);
+  const srcStart = srcStartFieldId ? f[srcStartFieldId] : null;
+  f.__startDateMirror = srcStart ? String(srcStart) : '—';
+  if (srcStart && tgtStartFieldId){
+    const dd = onlyDate(srcStart) || srcStart;
+    fields[tgtStartFieldId] = dd;
+  }
+
+  if (Object.keys(fields).length === 0) return;
+
+  _log(`[UI] ${targetKey} set priority/start/due (create-only)`);
+  const res = _fetch(`${_base(CFG.TARGET.SITE)}/issue/${encodeURIComponent(targetKey)}`, {
+    method:'put', headers:_hdrJson(CFG.TARGET.EMAIL, CFG.TARGET.TOKEN), payload: JSON.stringify({ fields })
+  });
+  if(res.getResponseCode()>=300) Logger.log(res.getContentText());
+}
+
+/** ===== Main Sync ===== **/
+function Sync_Latcha_to_ClicT(){
+  const lock = LockService.getScriptLock();
+  if(!lock.tryLock(5000)){ Logger.log('Another run in progress. Skipping.'); return; }
+
+  const started = Date.now();
+  const st = stateLoad();
+
+  try{
+    const backfilled = (metaGet(st,'BACKFILL_DONE') === 'yes');
+    const lastSyncAt = metaGet(st,'LAST_SYNC_AT');
+    const tieKey     = metaGet(st,'LAST_SYNC_TIE') || '';
+
+    let jql = '';
+    if(!backfilled || !lastSyncAt){
+      jql = CFG.JQL_FULL;
+      _log('[MODE] BACKFILL');
+    }else{
+      const sinceISO = new Date(new Date(lastSyncAt).getTime() - CFG.DELTA_BUFFER_MINUTES*60000).toISOString();
+      const sinceJql = toJqlDateTime(sinceISO); // Jira needs "YYYY-MM-DD HH:mm"
+      jql = CFG.JQL_DELTA.replace('{SINCE}', sinceJql);
+      _log('[MODE] DELTA since', sinceISO, '→ JQL:', sinceJql);
+    }
+
+    const baseFields = ['summary','issuetype','description','attachment','priority','labels','duedate','reporter','assignee','status','created','updated','project'];
+    const srcStartId = discoverStartDateFieldId(CFG.SOURCE.SITE, CFG.SOURCE.EMAIL, CFG.SOURCE.TOKEN, 'SRC_START_FIELD', st);
+    if (srcStartId) baseFields.push(srcStartId);
+
+    let issues = sourceSearchEnhanced(jql, baseFields);
+
+    // Backstop: during testing, if Delta yields 0, scan a small window to catch edits.
+    if (issues.length === 0 && lastSyncAt && CFG.DELTA_BACKSTOP){
+      _log('[DELTA] 0 results; trying backstop window', CFG.DELTA_BACKSTOP);
+      const backstopJql = `project = MP AND updated >= ${CFG.DELTA_BACKSTOP} ORDER BY updated ASC`;
+      issues = sourceSearchEnhanced(backstopJql, baseFields);
+    }
+
+    let processed = 0, lastSeenUpdated = lastSyncAt || null, lastSeenKey = tieKey;
+
+    for(const it of issues){
+      if(Date.now() - started > CFG.SOFT_TIME_BUDGET_MS){
+        _log('[BUDGET] Stopping early, will resume next trigger');
+        break;
+      }
+
+      const sk = it.key, f = it.fields || {};
+      const updatedISO = f.updated || f.created || nowISO();
+
+      // delta tiebreaker
+      if(lastSyncAt){
+        const cmp = (new Date(updatedISO).getTime()) - (new Date(lastSyncAt).getTime());
+        if(cmp < 0) continue;
+        if(cmp === 0 && sk <= tieKey) continue;
+      }
+
+      const { key: tk, created } = ensureIssueOnTarget(it, st);
+      if(!tk) continue;
+
+      // Always import new attachments (non-destructive)
+      syncAttachments(sk, tk);
+
+      // Description always overwritten from Latcha (with italic facts)
+      if (CFG.POLICY.OVERWRITE_DESC_ALWAYS) {
+        updateDescriptionOnTargetWithADF(tk, f, st);
+      }
+
+      // Comments always synced (dedup + edit-aware)
+      if (CFG.POLICY.SYNC_COMMENTS_ALWAYS) {
+        const {created:cNew, updated:cUpd} = syncComments(sk, tk, st);
+        _log(`[COMM] ${sk} → ${tk} +${cNew} ~${cUpd}`);
+      }
+
+      // Status: only on create (handled inside ensureIssueOnTarget)
+      if (!created && CFG.POLICY.MATCH_STATUS_ON_UPDATE) {
+        ensureStatusSync(tk, (f.status && f.status.name) || '');
+      }
+
+      // UI fields: only on create (handled inside ensureIssueOnTarget)
+      if (!created && CFG.POLICY.SET_UI_ON_UPDATE) {
+        updateTargetUIFields(tk, f, st);
+      }
+
+      // Non-invasive drift label so you can see if Latcha status diverges
+      ensureStatusLabel(tk, (f.status && f.status.name) || '');
+
+      processed++;
+      lastSeenUpdated = updatedISO;
+      lastSeenKey     = sk;
+    }
+
+    if(processed > 0 && lastSeenUpdated){
+      metaSet(st,'LAST_SYNC_AT', lastSeenUpdated);
+      metaSet(st,'LAST_SYNC_TIE', lastSeenKey);
+    }
+    if(!backfilled){ metaSet(st,'BACKFILL_DONE', 'yes'); }
+
+    _log(`[DONE] processed=${processed} DRY_RUN=${CFG.DRY_RUN}`);
+  } catch (e){
+    Logger.log('ERROR: '+ (e && e.stack || e));
+  } finally {
+    stateSave(st);
+    lock.releaseLock();
+  }
+}
+
+/** ===== Utilities / Admin ===== **/
+function Reset_Mirror_State(){
+  const sh = sheet_();
+  sh.clear();
+  sh.getRange(1,1,1,6).setValues([['Type','Key1','Key2','Key3','Value','UpdatedAt']]);
+  Logger.log('Sheet state cleared.');
+}
+function Dump_State(){
+  const st = stateLoad();
+  Logger.log('META: ' + JSON.stringify(st.meta, null, 2));
+  Logger.log('MAP size: ' + st.map.size);
+  Logger.log('COMM size: ' + st.comm.size);
+}
+function _log(...a){ Logger.log(a.map(x=>typeof x==='string'?x:JSON.stringify(x)).join(' ')); }
