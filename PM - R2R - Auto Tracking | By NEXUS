@@ -1,70 +1,60 @@
 /*******************************
- * Azure DevOps → Google Sheets
- * Current Sprint | Read-only | Fully automated + Manual Capacity tab
- * Tabs: Tasks, Bugs, Resource Summary, Capacity (Manual), Remaining_Log (via separate trigger)
- * Run: runSprintReport_Current()
+ * Azure DevOps → Google Sheets (Turbo Max CRM, styled & fixed)
+ * Tabs: Tasks, Bugs, Resource Summary, Capacity (Per-Day), Remaining_Log
+ * Entry: runSprintReport_Current()
  *******************************/
 
-// ==== HARD-CODED CONFIG (edit if needed) ====
-const ADO_ORG     = "Clictell";
-const ADO_PROJECT = "Clictell";    // <-- change if your project name differs
-const ADO_TEAM    = "Clictell Team"; // <-- set to the EXACT DevOps Team name from Boards → Sprints
-const ADO_PAT     = ""; // <- your PAT
+// ==== HARD-CODED CONFIG (Turbo Max CRM) ====
+const ADO_ORG        = "Clictell";
+const ADO_PROJECT_ID = "0b0a27a1-82bc-4fee-b3fe-cccbfb1a3164"; // Turbo Max CRM (GUID)
+const ADO_TEAM       = "Turbo Max CRM Team";                   // EXACT team name as in Boards → Teams
+const ADO_PAT        = ""; // test PAT
 
-// Manual capacity fallback (per person per working day)
-const MANUAL_HOURS_PER_DAY = 8;
+// ==== UI THEME ====
+const THEME_HEADER_BG = "#e8cc86"; // requested header color
+const THEME_ROW_BAND  = SpreadsheetApp.BandingTheme.LIGHT_GREY;
 
 /** ---------- Entry Points ---------- **/
 
 function runSprintReport_Current() {
-  const cfg = { org: ADO_ORG, project: ADO_PROJECT, team: ADO_TEAM, pat: ADO_PAT };
+  const cfg = { org: ADO_ORG, projectId: ADO_PROJECT_ID, team: ADO_TEAM, pat: ADO_PAT };
 
   // 1) Current sprint (iteration)
   const iteration = getCurrentIteration_(cfg);
   const sprintName = iteration.name;
   const sprintPath = iteration.path;
   const sprintStart = new Date(iteration.attributes.startDate);
-  const sprintEnd = new Date(iteration.attributes.finishDate);
+  const sprintEnd   = new Date(iteration.attributes.finishDate);
 
-  // Working business days (Mon–Fri)
-  const workingDates = enumerateWorkingDates_(sprintStart, sprintEnd);
+  // 2) Team days off (sprint-scoped) and build team-aware working calendar (Mon–Fri minus team days off)
+  const teamDayOffSet = getTeamDaysOff_(cfg, iteration.id); // Set("YYYY-MM-DD")
+  const workingDates  = enumerateWorkingDatesTeamAware_(sprintStart, sprintEnd, teamDayOffSet);
 
-  // 2) Capacity (automated) for Resource Summary
+  // 3) Capacity (API) for Resource Summary & per-day grid (minus personal days off)
   let capacityByUser = {};
   try {
-    capacityByUser = getCapacityByUser_(cfg, iteration.id, sprintStart, sprintEnd);
+    capacityByUser = getCapacityByUser_(cfg, iteration.id, sprintStart, sprintEnd, teamDayOffSet);
   } catch (e) {
-    // If capacity API is not configured, continue; Resource Summary will still compute from work items
     capacityByUser = {};
   }
 
-  // 3) Work items for current sprint (Tasks + Bugs)
+  // 4) Work items for current sprint (Tasks + Bugs)
   const ids = queryWorkItemIdsForIteration_(cfg, sprintPath, ["Task", "Bug"]);
   const fields = [
-    "System.Id",
-    "System.WorkItemType",
-    "System.Title",
-    "System.State",
-    "Microsoft.VSTS.Common.Priority",
-    "System.AssignedTo",
-    "Microsoft.VSTS.Scheduling.Effort",
-    "Microsoft.VSTS.Scheduling.OriginalEstimate",
-    "Microsoft.VSTS.Scheduling.RemainingWork",
-    "Microsoft.VSTS.Scheduling.StartDate",
-    "Microsoft.VSTS.Scheduling.DueDate",
-    "Microsoft.VSTS.Common.ClosedDate",
-    "Microsoft.VSTS.Common.Activity",
-    "System.IterationPath"
+    "System.Id","System.WorkItemType","System.Title","System.State","Microsoft.VSTS.Common.Priority",
+    "System.AssignedTo","Microsoft.VSTS.Scheduling.Effort","Microsoft.VSTS.Scheduling.OriginalEstimate",
+    "Microsoft.VSTS.Scheduling.RemainingWork","Microsoft.VSTS.Scheduling.StartDate","Microsoft.VSTS.Scheduling.DueDate",
+    "Microsoft.VSTS.Common.ClosedDate","Microsoft.VSTS.Common.Activity","System.IterationPath"
   ];
   const items = fetchWorkItemsBatch_(cfg, ids, fields);
 
-  // 4) Transform rows with calculations
+  // 5) Transform rows with calculations
   const today = todayMidnight_();
-  const expectedPct = expectedPercent_(today, sprintStart, sprintEnd); // 0..100
+  const expectedPct = expectedPercentWorkingDays_(today, workingDates); // 0..100 (Mon–Fri minus offs)
 
   const rowsTasks = [];
-  const rowsBugs = [];
-  const rollup = {}; // per person rollup
+  const rowsBugs  = [];
+  const rollup = {}; // per person: { planned, actual, remaining }
 
   for (const wi of items) {
     const f = wi.fields || {};
@@ -74,26 +64,20 @@ function runSprintReport_Current() {
     const title = f["System.Title"] || "";
     const state = f["System.State"] || "";
     const priority = toNumber_(f["Microsoft.VSTS.Common.Priority"]);
-    const assignedTo = extractAssignee_(f["System.AssignedTo"]);
+    const assignedTo = extractAssignee_(f["System.AssignedTo"]); // normalized (no email)
     // Effort: prefer Effort, fallback OriginalEstimate
     const effort = pickNumber_(f["Microsoft.VSTS.Scheduling.Effort"], f["Microsoft.VSTS.Scheduling.OriginalEstimate"]);
     const remaining = toNumber_(f["Microsoft.VSTS.Scheduling.RemainingWork"]);
     const startDate = toDateOrNull_(f["Microsoft.VSTS.Scheduling.StartDate"]);
-    const dueDate = toDateOrNull_(f["Microsoft.VSTS.Scheduling.DueDate"]);
-    const closedDate = toDateOrNull_(f["Microsoft.VSTS.Common.ClosedDate"]);
-    const activity = f["Microsoft.VSTS.Common.Activity"] || "";
+    const dueDate   = toDateOrNull_(f["Microsoft.VSTS.Scheduling.DueDate"]);
+    const closedDate= toDateOrNull_(f["Microsoft.VSTS.Common.ClosedDate"]);
+    const activity  = f["Microsoft.VSTS.Common.Activity"] || "";
     const iterationPath = f["System.IterationPath"] || "";
 
     const progressPct = progressPercent_(effort, remaining, state);
-    const utilized = Math.max(0, (effort || 0) - (remaining || 0));
+    const utilized    = Math.min((effort || 0), Math.max(0, (effort || 0) - (remaining || 0))); // cap
 
-    const status = computeStatus_({
-      state,
-      progressPct,
-      expectedPct,
-      dueDate,
-      startDate
-    });
+    const status = computeStatus_({ state, progressPct, expectedPct, dueDate, startDate });
 
     const row = [
       id, type, title, assignedTo, state, priority,
@@ -102,51 +86,54 @@ function runSprintReport_Current() {
       activity, iterationPath,
       round2_(progressPct), round2_(expectedPct),
       status,
-      utilized
+      round2_(utilized)
     ];
+    if (typeLc === "bug") rowsBugs.push(row); else if (typeLc === "task") rowsTasks.push(row);
 
-    if (typeLc === "bug") rowsBugs.push(row);
-    else if (typeLc === "task") rowsTasks.push(row);
-
-    // rollup per person
     if (assignedTo) {
       rollup[assignedTo] = rollup[assignedTo] || { planned: 0, actual: 0, remaining: 0 };
-      rollup[assignedTo].planned  += (effort || 0);
-      rollup[assignedTo].actual   += utilized;
-      rollup[assignedTo].remaining+= (remaining || 0);
+      rollup[assignedTo].planned   += (effort || 0);
+      rollup[assignedTo].actual    += utilized;
+      rollup[assignedTo].remaining += (remaining || 0);
     }
   }
 
-  // 5) Write Tasks and Bugs
-  upsertSheet_("Tasks", [
+  // 6) Write Tasks and Bugs + style + conditional formatting
+  const taskHeaders = [
     "ID","Work Item Type","Title","Assigned To","State","Priority",
     "Effort","Remaining","Start Date","Due Date","Closed Date",
     "Activity","Iteration Path","Progress %","Expected %","Status","Utilized"
-  ], rowsTasks);
+  ];
+  upsertSheet_("Tasks", taskHeaders, rowsTasks);
+  applyTableStyle_("Tasks");
+  applyStatusColorRules_("Tasks", 16 /* Status col index */);
+  // OPTIONAL: show 0..100 with a % sign (no scaling)
+  // applyPercentTextFormat_("Tasks", [14, 15]);
 
-  upsertSheet_("Bugs", [
-    "ID","Work Item Type","Title","Assigned To","State","Priority",
-    "Effort","Remaining","Start Date","Due Date","Closed Date",
-    "Activity","Iteration Path","Progress %","Expected %","Status","Utilized"
-  ], rowsBugs);
+  upsertSheet_("Bugs", taskHeaders, rowsBugs);
+  applyTableStyle_("Bugs");
+  applyStatusColorRules_("Bugs", 16);
+  // applyPercentTextFormat_("Bugs", [14, 15]);
 
-  // 6) Resource Summary (merge rollup with automated capacity where available)
+  // 7) Resource Summary — names only, no "Capacity Source"
   const resRows = [];
   const allPeople = new Set(Object.keys(rollup).concat(Object.keys(capacityByUser)));
   for (const person of allPeople) {
     const r = rollup[person] || { planned: 0, actual: 0, remaining: 0 };
-    const capObj = capacityByUser[person] || { effectiveCapacity: 0, capacityPerDay: 0, workingDays: workingDates.length, daysOffCount: 0 };
-    const planned  = r.planned;
-    const actual   = r.actual;
-    const remaining= r.remaining;
-    const effCap   = capObj.effectiveCapacity || 0; // could be 0 if not set in ADO
+    const capObj = capacityByUser[person] || {
+      capacityPerDay: 0, workingDays: workingDates.length, daysOffCount: 0, effectiveCapacity: 0
+    };
+    const planned    = r.planned;
+    const actual     = r.actual;
+    const remaining  = r.remaining;
+    const effCap     = capObj.effectiveCapacity || 0;
 
     const progressPctPerson = planned > 0 ? (actual / planned * 100) : 0;
     const allocationPct     = effCap > 0 ? (planned / effCap * 100) : 0;
     const utilizationPct    = effCap > 0 ? (actual / effCap * 100) : 0;
 
     resRows.push([
-      person,
+      person,                         // name only
       sprintName,
       round2_(capObj.capacityPerDay || 0),
       capObj.workingDays || 0,
@@ -161,28 +148,32 @@ function runSprintReport_Current() {
     ]);
   }
 
-  upsertSheet_("Resource Summary", [
+  const resHeaders = [
     "Resource","Sprint","Capacity per Day (hrs)","Working Days","Days Off (days)","Effective Sprint Capacity (hrs)",
     "Planned Hours (Σ Effort)","Actual Hours Spent (Σ Utilized)","Remaining Hours (Σ Remaining)",
     "Progress % (Actual/Planned)","Allocation % (Planned/Capacity)","Utilization % (Actual/Capacity)"
-  ], sortBy_(resRows, 0 /* Resource */));
+  ];
+  upsertSheet_("Resource Summary", resHeaders, sortBy_(resRows, 0));
+  applyTableStyle_("Resource Summary");
+  // applyPercentTextFormat_("Resource Summary", [10, 11, 12]);
 
-  // 7) Capacity (Manual) — hard-code 8 hrs/day by working day index (1..N)
-  buildManualCapacitySheet_(workingDates, rollup, sprintName);
+  // 8) Capacity (Per-Day) — date headers, API-driven; union of names (capacity ∪ rollup)
+  buildCapacityPerDayFromApi_("Capacity (Per-Day)", workingDates, capacityByUser, rollup);
+  applyTableStyle_("Capacity (Per-Day)");
+  // With current layout, percent-like columns are at P/Q/T (16/17/20). Use this only if you want "NN.NN %"
+  // applyPercentTextFormat_("Capacity (Per-Day)", [16, 17, 20]);
+
+  // 9) Sprint banner (row 1 A–D)
+  ["Tasks","Bugs","Resource Summary","Capacity (Per-Day)"].forEach(n => stampSprintBanner_(n, sprintName, sprintStart, sprintEnd));
 }
 
 function snapshotRemainingLog_Current() {
-  const cfg = { org: ADO_ORG, project: ADO_PROJECT, team: ADO_TEAM, pat: ADO_PAT };
+  const cfg = { org: ADO_ORG, projectId: ADO_PROJECT_ID, team: ADO_TEAM, pat: ADO_PAT };
   const iteration = getCurrentIteration_(cfg);
   const sprintPath = iteration.path;
 
   const ids = queryWorkItemIdsForIteration_(cfg, sprintPath, ["Task","Bug"]);
-  const fields = [
-    "System.Id",
-    "System.Title",
-    "System.AssignedTo",
-    "Microsoft.VSTS.Scheduling.RemainingWork"
-  ];
+  const fields = ["System.Id","System.Title","System.AssignedTo","Microsoft.VSTS.Scheduling.RemainingWork"];
   const items = fetchWorkItemsBatch_(cfg, ids, fields);
 
   const ss = SpreadsheetApp.getActive();
@@ -191,9 +182,7 @@ function snapshotRemainingLog_Current() {
     sh.appendRow(["Date","Task ID","Title","Assigned To","Remaining (hrs)","Spent Since Last (hrs)"]);
   }
 
-  // Build last remaining map per task ID from existing log (fast scan)
   const lastMap = buildLastRemainingMap_(sh);
-
   const today = todayMidnight_();
   const rows = [];
   for (const wi of items) {
@@ -202,32 +191,20 @@ function snapshotRemainingLog_Current() {
     const title = f["System.Title"] || "";
     const assignedTo = extractAssignee_(f["System.AssignedTo"]);
     const remaining = toNumber_(f["Microsoft.VSTS.Scheduling.RemainingWork"]);
-
     const key = String(id);
     const prev = lastMap[key] != null ? lastMap[key] : remaining;
-    const spentSinceLast = Math.max(0, prev - (remaining || 0));
-
-    rows.push([asDateValue_(today), id, title, assignedTo, remaining, round2_(spentSinceLast)]);
+    const spentSinceLast = round2_((prev || 0) - (remaining || 0)); // can be negative
+    rows.push([asDateValue_(today), id, title, assignedTo, remaining, spentSinceLast]);
   }
 
   if (rows.length) sh.getRange(sh.getLastRow()+1, 1, rows.length, rows[0].length).setValues(rows);
-}
-
-function createDailyRemainingLogTrigger() {
-  // Runs snapshot at 7:00 PM Asia/Kolkata (IST) daily
-  ScriptApp.newTrigger("snapshotRemainingLog_Current")
-    .timeBased()
-    .atHour(19)
-    .nearMinute(0)
-    .inTimezone("Asia/Kolkata")
-    .everyDays(1)
-    .create();
+  applyTableStyle_("Remaining_Log");
 }
 
 /** ---------- DevOps API Helpers ---------- **/
 
 function getCurrentIteration_(cfg) {
-  const url = `https://dev.azure.com/${enc(cfg.org)}/${enc(cfg.project)}/${enc(cfg.team)}` +
+  const url = `https://dev.azure.com/${enc(cfg.org)}/${enc(cfg.projectId)}/${enc(cfg.team)}` +
               `/_apis/work/teamsettings/iterations?$timeframe=current&api-version=7.1-preview.1`;
   const res = adoFetch_(cfg, url, "GET");
   const list = res.value || [];
@@ -235,33 +212,40 @@ function getCurrentIteration_(cfg) {
   return list[0]; // {id, name, path, attributes:{startDate, finishDate}}
 }
 
-function getCapacityByUser_(cfg, iterationId, sprintStart, sprintEnd) {
-  const url = `https://dev.azure.com/${enc(cfg.org)}/${enc(cfg.project)}/${enc(cfg.team)}` +
+function getTeamDaysOff_(cfg, iterationId) {
+  const url = `https://dev.azure.com/${enc(cfg.org)}/${enc(cfg.projectId)}/${enc(cfg.team)}` +
+              `/_apis/work/teamsettings/iterations/${enc(iterationId)}/teamdaysoff?api-version=7.1-preview.1`;
+  const res = adoFetch_(cfg, url, "GET"); // { daysOff: [{start, end}, ...] }
+  const ranges = (res.daysOff || []).flatMap(r => expandDateRange_(r.start, r.end));
+  return new Set(ranges.map(d => fmtDateKey_(d)));
+}
+
+function getCapacityByUser_(cfg, iterationId, sprintStart, sprintEnd, teamDayOffSet) {
+  const url = `https://dev.azure.com/${enc(cfg.org)}/${enc(cfg.projectId)}/${enc(cfg.team)}` +
               `/_apis/work/teamsettings/iterations/${enc(iterationId)}/capacities?api-version=7.1-preview.1`;
   const res = adoFetch_(cfg, url, "GET");
   const values = res.value || [];
-  const workingDates = enumerateWorkingDates_(sprintStart, sprintEnd); // Mon-Fri
+  const workingDates = enumerateWorkingDatesTeamAware_(sprintStart, sprintEnd, teamDayOffSet); // Mon–Fri minus team offs
 
   const out = {};
   for (const entry of values) {
     const member = entry.teamMember || {};
-    const name = member.displayName || member.uniqueName || "";
+    const name = canonicalName_(member.displayName || member.uniqueName || ""); // strip emails
     if (!name) continue;
 
     // Sum capacity per day across activities
     let capacityPerDay = 0;
-    const acts = entry.activities || [];
-    for (const a of acts) capacityPerDay += toNumber_(a.capacityPerDay);
+    for (const a of (entry.activities || [])) capacityPerDay += toNumber_(a.capacityPerDay);
 
-    // Expand personal days off
-    const daysOff = (entry.daysOff || []).flatMap(r => expandDateRange_(r.start, r.end));
-    const dayOffSet = new Set(daysOff.map(d => fmtDateKey_(d)));
+    // Personal days off (weekdays only)
+    const personalDays = (entry.daysOff || []).flatMap(r => expandDateRange_(r.start, r.end))
+                        .filter(isWeekday_).map(fmtDateKey_);
+    const personalOffSet = new Set(personalDays);
 
-    // Compute effective capacity = capacityPerDay * (working days − personal days off)
+    // Effective capacity = capacityPerDay * (team-working-days − personal weekday offs)
     let effectiveDays = 0;
     for (const d of workingDates) {
-      const key = fmtDateKey_(d);
-      if (dayOffSet.has(key)) continue;
+      if (personalOffSet.has(fmtDateKey_(d))) continue;
       effectiveDays++;
     }
     const effectiveCapacity = round2_(capacityPerDay * effectiveDays);
@@ -269,8 +253,10 @@ function getCapacityByUser_(cfg, iterationId, sprintStart, sprintEnd) {
     out[name] = {
       capacityPerDay: round2_(capacityPerDay),
       workingDays: workingDates.length,
-      daysOffCount: daysOff.filter(d => isWeekday_(d)).length, // count only weekdays
-      effectiveCapacity
+      daysOffCount: personalOffSet.size,
+      effectiveCapacity,
+      workingDates,
+      personalOffSet
     };
   }
   return out;
@@ -284,7 +270,7 @@ function queryWorkItemIdsForIteration_(cfg, iterationPath, types /*array*/) {
       `WHERE [System.IterationPath] UNDER '${escapeQuotes_(iterationPath)}' ` +
       `AND [System.WorkItemType] IN (${typesClause})`
   };
-  const url = `https://dev.azure.com/${enc(cfg.org)}/${enc(cfg.project)}` +
+  const url = `https://dev.azure.com/${enc(cfg.org)}/${enc(cfg.projectId)}` +
               `/_apis/wit/wiql?api-version=7.1-preview.2`;
   const res = adoFetch_(cfg, url, "POST", wiql);
   const workItems = res.workItems || [];
@@ -296,7 +282,7 @@ function fetchWorkItemsBatch_(cfg, ids, fields) {
   const chunks = chunk_(ids, 180); // safe batch size
   const out = [];
   for (const group of chunks) {
-    const url = `https://dev.azure.com/${enc(cfg.org)}/${enc(cfg.project)}` +
+    const url = `https://dev.azure.com/${enc(cfg.org)}/${enc(cfg.projectId)}` +
                 `/_apis/wit/workitemsbatch?api-version=7.1-preview.1`;
     const payload = { ids: group, fields: fields };
     const res = adoFetch_(cfg, url, "POST", payload);
@@ -333,17 +319,11 @@ function adoFetch_(cfg, url, method, payload) {
 /** ---------- Calculations & Utils ---------- **/
 
 function computeStatus_({ state, progressPct, expectedPct, dueDate, startDate }) {
-  // Values Missing takes precedence if dates are needed for "time awareness"
   if (!startDate || !dueDate) return "Values Missing";
-
   if ((state || "").toLowerCase() === "done" || progressPct >= 99) return "Completed";
-
   const today = todayMidnight_();
-  if (dueDate && ymd_(dueDate) < ymd_(today)) return "Overdue"; // past due
-
-  // Dynamic time awareness: compare work progress vs time elapsed
+  if (dueDate && ymd_(dueDate) < ymd_(today)) return "Overdue";
   if (progressPct < (expectedPct - 15)) return "At Risk";
-
   return "On Track";
 }
 
@@ -355,132 +335,198 @@ function progressPercent_(effort, remaining, state) {
   return Math.min(100, Math.max(0, (used / effort) * 100));
 }
 
-function expectedPercent_(today, start, end) {
-  if (!start || !end) return 0;
-  const t = clampDate_(today, start, end);
-  const span = end - start;
-  if (span <= 0) return 100;
-  return Math.min(100, Math.max(0, ((t - start) / span) * 100));
+// Working-day expected %, based on team-aware working dates
+function expectedPercentWorkingDays_(today, workingDates) {
+  if (!workingDates || !workingDates.length) return 0;
+  const t = new Date(today); t.setHours(0,0,0,0);
+  const elapsed = workingDates.filter(d => d <= t).length;
+  return Math.min(100, Math.max(0, (elapsed / workingDates.length) * 100));
 }
 
-function enumerateWorkingDates_(start, end) {
-  // Mon-Fri only
+function enumerateWorkingDatesTeamAware_(start, end, teamDayOffSet) {
   const out = [];
-  let d = new Date(start);
-  d.setHours(0,0,0,0);
-  const last = new Date(end);
-  last.setHours(0,0,0,0);
-  for (; d <= last; d = addDays_(d, 1)) {
-    if (isWeekday_(d)) out.push(new Date(d));
+  const s = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+  const e = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  for (let d = s; d <= e; d = addDays_(d, 1)) {
+    const dd = new Date(d);
+    if (isWeekday_(dd) && !teamDayOffSet.has(fmtDateKey_(dd))) out.push(dd);
   }
   return out;
 }
 
-function expandDateRange_(startISO, endISO) {
-  if (!startISO || !endISO) return [];
-  const s = new Date(startISO);
-  const e = new Date(endISO);
-  s.setHours(0,0,0,0);
-  e.setHours(0,0,0,0);
-  const out = [];
-  for (let d = new Date(s); d <= e; d = addDays_(d, 1)) out.push(new Date(d));
-  return out;
-}
-
-function isWeekday_(d) {
-  const day = d.getDay();
-  return day !== 0 && day !== 6; // not Sun/Sat
-}
-
-function addDays_(d, n) {
-  const x = new Date(d);
-  x.setDate(x.getDate() + n);
-  return x;
-}
-
-function todayMidnight_() {
-  const t = new Date();
-  t.setHours(0,0,0,0);
-  return t;
-}
-
-function ymd_(d) {
-  return d.getFullYear()*10000 + (d.getMonth()+1)*100 + d.getDate();
-}
-
-function clampDate_(d, start, end) {
-  if (d < start) return new Date(start);
-  if (d > end) return new Date(end);
-  return d;
-}
-
-function toNumber_(v) {
-  const n = Number(v);
-  return isNaN(n) ? 0 : n;
-}
-
-function pickNumber_(a, b) {
-  const aa = toNumber_(a);
-  if (aa) return aa;
-  return toNumber_(b);
-}
-
-function toDateOrNull_(v) {
-  if (!v) return null;
-  const d = new Date(v);
-  return isNaN(d.getTime()) ? null : d;
-}
-
-function asDateValue_(d) {
-  return d ? new Date(d) : "";
-}
-
-function extractAssignee_(assigneeField) {
-  if (!assigneeField) return "";
-  if (typeof assigneeField === "string") return assigneeField;
-  if (assigneeField.displayName) return assigneeField.displayName;
-  if (assigneeField.uniqueName) return assigneeField.uniqueName;
-  return "";
-}
-
-/** ---------- Sheets Helpers ---------- **/
+/** ---------- Sheets Helpers (data write) ---------- **/
 
 function upsertSheet_(name, headers, rows) {
   const ss = SpreadsheetApp.getActive();
   const sh = ss.getSheetByName(name) || ss.insertSheet(name);
+  sh.clearFormats();
   sh.clearContents();
   if (headers && headers.length) sh.appendRow(headers);
   if (rows && rows.length) sh.getRange(2, 1, rows.length, headers.length).setValues(rows);
   sh.autoResizeColumns(1, Math.max(1, headers.length));
 }
 
-function sortBy_(rows, colIndex) {
-  return rows.sort((a,b) => {
-    const x = (a[colIndex]||"").toString().toLowerCase();
-    const y = (b[colIndex]||"").toString().toLowerCase();
-    if (x<y) return -1;
-    if (x>y) return 1;
-    return 0;
+/** ---------- UI Styling Helpers ---------- **/
+
+function applyTableStyle_(sheetName) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
+  if (!sh) return;
+
+  const lastRow = Math.max(1, sh.getLastRow());
+  const lastCol = Math.max(1, sh.getLastColumn());
+
+  // Freeze header
+  sh.setFrozenRows(1);
+
+  // Header style
+  const header = sh.getRange(1, 1, 1, lastCol);
+  header.setBackground(THEME_HEADER_BG)
+        .setFontWeight("bold")
+        .setHorizontalAlignment("center");
+
+  // Borders for full used range
+  const rng = sh.getRange(1, 1, lastRow, lastCol);
+  rng.setBorder(true, true, true, true, true, true);
+
+  // Clear existing bandings
+  const bandings = sh.getBandings ? sh.getBandings() : [];
+  bandings.forEach(b => b.remove());
+
+  // Zebra banding for data area (row 2 onward)
+  if (lastRow > 2) {
+    const bandRange = sh.getRange(2, 1, lastRow - 1, lastCol);
+    bandRange.applyRowBanding(THEME_ROW_BAND);
+  }
+}
+
+function applyStatusColorRules_(sheetName, statusColIndex) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
+  if (!sh) return;
+
+  const lastRow = Math.max(2, sh.getLastRow());
+  if (lastRow < 2) return;
+
+  const statusRange = sh.getRange(2, statusColIndex, lastRow - 1, 1);
+
+  const existing = sh.getConditionalFormatRules() || [];
+  const keep = existing.filter(r => {
+    const ranges = r.getRanges().map(x => x.getA1Notation()).join(",");
+    return !ranges.includes(statusRange.getA1Notation());
+  });
+
+  const newRules = [
+    SpreadsheetApp.newConditionalFormatRule().setRanges([statusRange]).whenTextEqualTo("Overdue")
+      .setBackground("#f44336").setFontColor("#ffffff").build(),
+    SpreadsheetApp.newConditionalFormatRule().setRanges([statusRange]).whenTextEqualTo("Completed")
+      .setBackground("#388e3c").setFontColor("#ffffff").build(),
+    SpreadsheetApp.newConditionalFormatRule().setRanges([statusRange]).whenTextEqualTo("On Track")
+      .setBackground("#1e88e5").setFontColor("#ffffff").build(),
+    SpreadsheetApp.newConditionalFormatRule().setRanges([statusRange]).whenTextEqualTo("At Risk")
+      .setBackground("#f9a825").setFontColor("#000000").build(),
+    SpreadsheetApp.newConditionalFormatRule().setRanges([statusRange]).whenTextEqualTo("Values Missing")
+      .setBackground("#9e9e9e").setFontColor("#ffffff").build()
+  ];
+
+  sh.setConditionalFormatRules(keep.concat(newRules));
+}
+
+// OPTIONAL: show numbers 0..100 with a percent sign (no scaling to 0..1)
+function applyPercentTextFormat_(sheetName, columnIndexes /* 1-based array */) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
+  if (!sh) return;
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return;
+  columnIndexes.forEach(col => {
+    sh.getRange(2, col, lastRow - 1, 1).setNumberFormat('0.00"%"');
   });
 }
 
-function round2_(n) {
-  return Math.round((n + Number.EPSILON)*100)/100;
+/** ---------- Capacity (Per-Day) Sheet ---------- **/
+function buildCapacityPerDayFromApi_(tabName, workingDates, capacityByUser, rollup) {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(tabName) || ss.insertSheet(tabName);
+  sh.clearFormats();
+  sh.clearContents();
+
+  const dateFmt = (d)=> Utilities.formatDate(d, Session.getScriptTimeZone(), "EEE dd-MMM");
+  const dateHeaders = workingDates.map(dateFmt);
+  const headers = ["Name of Resource","Role","Capacity per Day (hrs)"]
+                  .concat(dateHeaders)
+                  .concat(["Effective Sprint Capacity","Planned Hours","Allocation % (planned/capacity)","Utilization Rate (actual/capacity)","Actual Hours Spent","Remaining Hours","% Progress"]);
+  sh.appendRow(headers);
+
+  // union of names from capacity and rollup
+  const unionNames = new Set(Object.keys(capacityByUser).concat(Object.keys(rollup || {})));
+  const people = Array.from(unionNames).sort((a,b)=>a.localeCompare(b));
+  const rows = [];
+
+  for (const person of people) {
+    const cap = capacityByUser[person] || {};
+    const capPerDay = cap.capacityPerDay || 0;
+    const personalOff = cap.personalOffSet || new Set();
+
+    const perDay = workingDates.map(d => personalOff.has(fmtDateKey_(d)) ? 0 : capPerDay);
+
+    const r = rollup[person] || { planned: 0, actual: 0, remaining: 0 };
+    const planned = round2_(r.planned), actual = round2_(r.actual), remaining = round2_(r.remaining);
+    const effCap  = round2_(cap.effectiveCapacity || perDay.reduce((a,b)=>a+b,0));
+    const allocation = effCap ? round2_(planned/effCap*100) : 0;
+    const utilRate   = effCap ? round2_(actual /effCap*100) : 0;
+    const progress   = planned ? round2_(actual/planned*100) : 0;
+
+    rows.push([person,"", round2_(capPerDay)].concat(perDay).concat([effCap, planned, allocation, utilRate, actual, remaining, progress]));
+  }
+
+  if (rows.length) sh.getRange(2,1,rows.length,headers.length).setValues(rows);
+  sh.autoResizeColumns(1, headers.length);
 }
 
-function chunk_(arr, size) {
+/** ---------- Sprint Banner ---------- **/
+function stampSprintBanner_(sheetName, sprintName, sprintStart, sprintEnd) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
+  if (!sh) return;
+  sh.getRange("A1").setValue(`Sprint: ${sprintName}`);
+  sh.getRange("B1").setValue(`Start: ${sprintStart.toDateString()}`);
+  sh.getRange("C1").setValue(`End: ${sprintEnd.toDateString()}`);
+  sh.getRange("D1").setValue(`Last Updated: ${new Date().toLocaleString("en-GB")}`);
+}
+
+/** ---------- Small utils ---------- **/
+function enc(s){ return encodeURIComponent(s); }
+function escapeQuotes_(s){ return String(s).replace(/'/g, "''"); }
+function canonicalName_(s){ if(!s) return ""; return String(s).replace(/\s*<[^>]+>\s*$/, "").trim(); }
+function extractAssignee_(assigneeField){
+  let raw = "";
+  if (!assigneeField) return "";
+  if (typeof assigneeField === "string") raw = assigneeField;
+  else if (assigneeField.displayName)   raw = assigneeField.displayName;
+  else if (assigneeField.uniqueName)    raw = assigneeField.uniqueName;
+  return canonicalName_(raw);
+}
+function toNumber_(v){ const n = Number(v); return isNaN(n) ? 0 : n; }
+function pickNumber_(a,b){ const aa = toNumber_(a); return aa ? aa : toNumber_(b); }
+function toDateOrNull_(v){ if(!v) return null; const d = new Date(v); return isNaN(d.getTime()) ? null : d; }
+function asDateValue_(d){ return d ? new Date(d) : ""; }
+function todayMidnight_(){ const t = new Date(); t.setHours(0,0,0,0); return t; }
+function ymd_(d){ return d.getFullYear()*10000 + (d.getMonth()+1)*100 + d.getDate(); }
+function round2_(n){ return Math.round((n + Number.EPSILON)*100)/100; }
+function sortBy_(rows, colIndex){ return rows.sort((a,b)=>{ const x=(a[colIndex]||"").toString().toLowerCase(); const y=(b[colIndex]||"").toString().toLowerCase(); return x<y?-1:x>y?1:0; }); }
+function chunk_(arr, size){ const out=[]; for (let i=0;i<arr.length;i+=size) out.push(arr.slice(i, i+size)); return out; }
+function fmtDateKey_(d){ const y=d.getFullYear(); const m=String(d.getMonth()+1).padStart(2,"0"); const day=String(d.getDate()).padStart(2,"0"); return `${y}-${m}-${day}`; }
+
+/** ---------- Weekday helpers ---------- **/
+function expandDateRange_(startISO, endISO){
+  if (!startISO || !endISO) return [];
+  const s = new Date(startISO), e = new Date(endISO);
+  s.setHours(0,0,0,0); e.setHours(0,0,0,0);
   const out = [];
-  for (let i=0;i<arr.length;i+=size) out.push(arr.slice(i, i+size));
+  for (let d = new Date(s); d <= e; d = addDays_(d, 1)) out.push(new Date(d));
   return out;
 }
+function isWeekday_(d){ const day = d.getDay(); return day !== 0 && day !== 6; }
+function addDays_(d,n){ const x = new Date(d); x.setDate(x.getDate()+n); return x; }
 
-function fmtDateKey_(d) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth()+1).padStart(2,"0");
-  const day = String(d.getDate()).padStart(2,"0");
-  return `${y}-${m}-${day}`;
-}
-
+/** ---------- Remaining Log helper ---------- **/
 function buildLastRemainingMap_(sh) {
   const lastRow = sh.getLastRow();
   const out = {};
@@ -495,60 +541,3 @@ function buildLastRemainingMap_(sh) {
   }
   return out;
 }
-
-/** ---------- Manual Capacity Sheet ---------- **/
-function buildManualCapacitySheet_(workingDates, rollup, sprintName) {
-  const ss = SpreadsheetApp.getActive();
-  const shName = "Capacity (Manual)";
-  const sh = ss.getSheetByName(shName) || ss.insertSheet(shName);
-  sh.clearContents();
-
-  const dayCount = workingDates.length;
-  // Headers: Name of Resource | Role | Total Avl Hours | 1..N | Effective Sprint Capacity | Planned Hours | Allocation % | Utilization Rate | Actual Hours Spent | Remaining Hours | % Progress
-  const headers = ["Name of Resource","Role","Total Avl Hours"];
-  for (let i = 1; i <= dayCount; i++) headers.push(String(i));
-  headers.push("Effective Sprint Capacity","Planned Hours","Allocation % (planned/available)","Utilization Rate (actual/available)","Actual Hours Spent","Remaining Hours","% Progress");
-  sh.appendRow(headers);
-
-  // People list: anyone who appears in rollup (from work items)
-  const people = Object.keys(rollup).sort((a,b)=>a.localeCompare(b));
-  const rows = [];
-  const totalAvail = MANUAL_HOURS_PER_DAY * dayCount;
-
-  for (const person of people) {
-    const r = rollup[person] || { planned: 0, actual: 0, remaining: 0 };
-    const planned   = r.planned;
-    const actual    = r.actual;
-    const remaining = r.remaining;
-
-    const allocation = totalAvail > 0 ? planned / totalAvail * 100 : 0;
-    const utilization= totalAvail > 0 ? actual  / totalAvail * 100 : 0;
-    const progress   = planned > 0 ? actual / planned * 100 : 0;
-
-    const row = [
-      person,
-      "", // Role (optional; you said it's not needed now)
-      totalAvail
-    ];
-    // Per working day hours (hard-coded 8)
-    for (let i = 0; i < dayCount; i++) row.push(MANUAL_HOURS_PER_DAY);
-    row.push(
-      totalAvail,                 // Effective Sprint Capacity
-      round2_(planned),           // Planned Hours
-      round2_(allocation),        // Allocation %
-      round2_(utilization),       // Utilization Rate
-      round2_(actual),            // Actual Hours Spent
-      round2_(remaining),         // Remaining Hours
-      round2_(progress)           // % Progress
-    );
-
-    rows.push(row);
-  }
-
-  if (rows.length) sh.getRange(2, 1, rows.length, headers.length).setValues(rows);
-  sh.autoResizeColumns(1, headers.length);
-}
-
-/** ---------- Small utils ---------- **/
-function enc(s){ return encodeURIComponent(s); }
-function escapeQuotes_(s){ return String(s).replace(/'/g, "''"); }
