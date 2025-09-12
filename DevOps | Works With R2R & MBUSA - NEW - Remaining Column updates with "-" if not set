@@ -1,0 +1,1378 @@
+/*******************************
+ * Azure DevOps → Google Sheets (Selector-enabled, auto-refresh, with Daily Utilization)
+ * Tabs: Tasks, Bugs, <Dept Tabs>, Resource Summary, Capacity (Per-Day, hidden), Remaining_Log (hidden), Daily Utilization
+ * Entry points:
+ *   - setupSprintSelector()  ← run once to create dropdown (Current + last 3)
+ *   - runSprintReport_Selected()
+ *   - runSprintReport_Current()
+ *   - enableSprintAutoRefresh() / disableSprintAutoRefresh()
+ *   - snapshotRemainingLog_Current()
+ *   - runDailyUtilizationReport_Current() / _Selected()
+ *   - installEvery2hAutomation() / uninstallAutomation()
+ *******************************/
+
+// ==== HARD-CODED CONFIG (Turbo Max CRM) ====
+const ADO_ORG        = "Clictell";
+const ADO_PROJECT_ID = "6ed44c04-644d-47c0-a4ab-782dc7a6fb04"; // Turbo Max CRM (GUID)
+const ADO_TEAM       = "MBUSA Team";                   // EXACT team name as in Boards → Teams
+const ADO_PAT        = ""; // PAT
+
+// Sheets & UI
+const SHEET_SELECTOR = "Sprint Selector";
+const SHEET_INDEX    = "_SprintIndex"; // hidden map Name↔Id/Path/Start/End
+
+// UI theme
+const THEME_HEADER_BG = "#e8cc86";
+const MAIN_HEADER_ROW = 6; // A1:B4 summary, row 5 blank, header on row 6
+
+// === COMPLETED OVERRIDE (by State — unconditional) ===
+const COMPLETED_OVERRIDE_STATES = new Set([
+  "done",
+  "approved",
+  "ready to production",
+  "ready to preprod",
+  "deployed to preprod",
+  "deployed on preprod",
+  "deployed on staging",
+  "deployed on production",
+  "deployed on development"
+].map(s => s.toLowerCase().trim()));
+
+/** ======================= MENU ======================= **/
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("Sprint Report")
+    .addItem("Setup Sprint Selector (Current + last 3)", "setupSprintSelector")
+    .addItem("Refresh Selected Sprint", "runSprintReport_Selected")
+    .addItem("Refresh Current Sprint", "runSprintReport_Current")
+    .addSeparator()
+    .addItem("Snapshot Remaining (Now)", "snapshotRemainingLog_Current")
+    .addItem("Build Daily Utilization (Latest Snapshot)", "runDailyUtilizationReport_Current")
+    .addSeparator()
+    .addItem("Install 2h Orchestrator", "installEvery2hAutomation")
+    .addItem("Uninstall 2h Orchestrator", "uninstallAutomation")
+    .addSeparator()
+    .addItem("Enable Auto-Refresh on Sprint Change", "enableSprintAutoRefresh")
+    .addItem("Disable Auto-Refresh Trigger", "disableSprintAutoRefresh")
+    .addToUi();
+}
+
+/** =================== ENTRY POINTS =================== **/
+
+function runSprintReport_Current() {
+  const cfg = { org: ADO_ORG, projectId: ADO_PROJECT_ID, team: ADO_TEAM, pat: ADO_PAT };
+  const iteration = getCurrentIteration_(cfg);
+  runSprintReport_ForIteration_(cfg, iteration);
+}
+
+function setupSprintSelector() {
+  const cfg = { org: ADO_ORG, projectId: ADO_PROJECT_ID, team: ADO_TEAM, pat: ADO_PAT };
+
+  const current = safeGetCurrentIteration_(cfg);
+  const past3 = safeGetPastIterations_(cfg, 3);
+
+  const list = [];
+  if (current) list.push(current);
+  list.push.apply(list, past3);
+  list.sort((a,b)=> new Date(b.attributes.startDate) - new Date(a.attributes.startDate));
+
+  const ss = SpreadsheetApp.getActive();
+  const idx = ss.getSheetByName(SHEET_INDEX) || ss.insertSheet(SHEET_INDEX);
+  idx.clear();
+  idx.appendRow(["Name","ID","Path","Start","End"]);
+  list.forEach(it => {
+    idx.appendRow([
+      it.name, it.id, it.path,
+      new Date(it.attributes.startDate), new Date(it.attributes.finishDate)
+    ]);
+  });
+  idx.hideSheet();
+
+  const sh = ss.getSheetByName(SHEET_SELECTOR) || ss.insertSheet(SHEET_SELECTOR);
+  sh.clear();
+  sh.appendRow(["Selected Sprint", "Pick a sprint name"]);
+  sh.setFrozenRows(1);
+  const namesRange = idx.getRange(2,1,Math.max(0, idx.getLastRow()-1),1);
+  if (namesRange.getNumRows() > 0) {
+    const rule = SpreadsheetApp.newDataValidation()
+      .requireValueInRange(namesRange, true)
+      .setAllowInvalid(false)
+      .build();
+    // editable cell is B2 but detect by header later for stability
+    sh.getRange("B2").setDataValidation(rule);
+    sh.getRange("B2").setValue(idx.getRange(2,1).getValue()); // preselect first
+  } else {
+    sh.getRange("B2").setValue("No sprints found");
+  }
+  styleHeaderRow_(SHEET_SELECTOR);
+  wrapHeaderFirstCol_(SHEET_SELECTOR);
+
+  runSprintReport_Selected();
+}
+
+function runSprintReport_Selected() {
+  const cfg = { org: ADO_ORG, projectId: ADO_PROJECT_ID, team: ADO_TEAM, pat: ADO_PAT };
+  const ss = SpreadsheetApp.getActive();
+  const sel = ss.getSheetByName(SHEET_SELECTOR);
+  const idx = ss.getSheetByName(SHEET_INDEX);
+  if (!sel || !idx) return;
+
+  const H = headerIndexMap_(sel);
+  const pickCol = (H["Pick a sprint name"] != null) ? (H["Pick a sprint name"] + 1) : 2;
+  const name = (sel.getRange(2, pickCol).getDisplayValue() || "").trim();
+  if (!name || name === "No sprints found") return;
+
+  const rows = idx.getRange(2,1,Math.max(0, idx.getLastRow()-1),5).getValues();
+  const rec = rows.find(r => String(r[0]).trim() === name);
+  if (!rec) return;
+
+  const iteration = {
+    name: rec[0], id: rec[1], path: rec[2],
+    attributes: { startDate: rec[3], finishDate: rec[4] }
+  };
+  runSprintReport_ForIteration_(cfg, iteration);
+}
+
+/** ============== AUTO-REFRESH TRIGGER ============== **/
+
+function enableSprintAutoRefresh() {
+  removeSprintAutoRefreshTriggers_();
+  ScriptApp.newTrigger("onSprintSelectEdit")
+    .forSpreadsheet(SpreadsheetApp.getActive())
+    .onEdit()
+    .create();
+}
+
+function disableSprintAutoRefresh() {
+  removeSprintAutoRefreshTriggers_();
+}
+
+function removeSprintAutoRefreshTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === "onSprintSelectEdit") {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+}
+
+function onSprintSelectEdit(e) {
+  try {
+    if (!e) return;
+    const range = e.range;
+    const sh = range.getSheet();
+    if (sh.getName() !== SHEET_SELECTOR) return;
+
+    const H = headerIndexMap_(sh);
+    const pickCol = (H["Pick a sprint name"] != null) ? (H["Pick a sprint name"] + 1) : 2;
+
+    if (range.getRow() === 2 && range.getColumn() === pickCol) {
+      runSprintReport_Selected();
+    }
+  } catch (err) {
+    Logger.log("onSprintSelectEdit error: " + err);
+  }
+}
+
+/** ============== CORE REPORT (by iteration) ============== **/
+function runSprintReport_ForIteration_(cfg, iteration) {
+  const sprintName = iteration.name;
+  const sprintPath = iteration.path;
+  const sprintStart = new Date(iteration.attributes.startDate);
+  const sprintEnd   = new Date(iteration.attributes.finishDate);
+
+  const teamDayOffSet = getTeamDaysOff_(cfg, iteration.id);
+  const workingDates  = enumerateWorkingDatesTeamAware_(sprintStart, sprintEnd, teamDayOffSet);
+
+  // Capacity
+  let capacityByUser = {};
+  try {
+    capacityByUser = getCapacityByUser_(cfg, iteration.id, sprintStart, sprintEnd, teamDayOffSet);
+  } catch (e) {
+    capacityByUser = {};
+  }
+
+  // Work items → include Task, Bug, User Story (for dept tabs)
+  const idsAll = queryWorkItemIdsForIteration_(cfg, sprintPath, ["Task","Bug","User Story"]);
+  const baseFields = [
+    "System.Id","System.WorkItemType","System.Title","System.State","Microsoft.VSTS.Common.Priority",
+    "System.AssignedTo","Microsoft.VSTS.Scheduling.Effort","Microsoft.VSTS.Scheduling.OriginalEstimate",
+    "Microsoft.VSTS.Scheduling.RemainingWork","Microsoft.VSTS.Scheduling.StartDate","Microsoft.VSTS.Scheduling.DueDate",
+    "Microsoft.VSTS.Common.ClosedDate","Microsoft.VSTS.Common.Activity",
+    "System.Parent"
+  ];
+  const allItems = fetchWorkItemsBatch_(cfg, idsAll, baseFields);
+
+  // Parent (User Story) lookup
+  const parentIds = Array.from(new Set(allItems.map(w => (w.fields||{})["System.Parent"]).filter(Boolean)));
+  const parentMap = (parentIds.length
+    ? fetchWorkItemsBatch_(cfg, parentIds, ["System.Id","System.Title","System.WorkItemType"])
+    : []).reduce((m, w) => { m[w.id] = w; return m; }, {});
+
+  const makeUserStoryInfo = (wi) => {
+    const f = wi.fields || {};
+    const type = (f["System.WorkItemType"] || "").toString();
+    if (type.toLowerCase() === "user story") {
+      return { id: wi.id, title: f["System.Title"] || "" };
+    }
+    const pid = f["System.Parent"];
+    const p = pid ? parentMap[pid] : null;
+    if (p && ((p.fields||{})["System.WorkItemType"]||"").toString().toLowerCase() === "user story") {
+      return { id: p.id, title: (p.fields||{})["System.Title"] || "" };
+    }
+    return { id: "", title: "NO PARENT ASSIGNED" };
+  };
+
+  // Build rows for main "Tasks" & "Bugs", and for dept tabs
+  const rowsTasks = [];
+  const rowsBugs  = [];
+  const notesTasks = [];
+  const notesBugs  = [];
+
+  const rowsAllForDept = [];
+  const notesAllForDept = [];
+
+  const rollup = {};
+  const today = todayMidnight_();
+
+  for (const wi of allItems) {
+    const f = wi.fields || {};
+    const theId = wi.id || "";
+    const type = (f["System.WorkItemType"] || "").toString();
+    const typeLc = type.toLowerCase();
+    const title = f["System.Title"] || "";
+    const state = f["System.State"] || "";
+    const stateLc = (state || "").toLowerCase();
+    const priority = toNumber_(f["Microsoft.VSTS.Common.Priority"]);
+    const assignedTo = extractAssignee_(f["System.AssignedTo"]);
+    const effort = pickNumber_(f["Microsoft.VSTS.Scheduling.Effort"], f["Microsoft.VSTS.Scheduling.OriginalEstimate"]);
+
+    // *** NEW: Remaining resolver (display + calc) ***
+    const remField = (f["Microsoft.VSTS.Scheduling.RemainingWork"]);
+    const r = resolveRemaining_(remField, effort, state);
+    const remainingCalc = r.calc;
+    const remainingDisplay = r.display;
+
+    const startDate = toDateOrNull_(f["Microsoft.VSTS.Scheduling.StartDate"]);
+    const dueDate   = toDateOrNull_(f["Microsoft.VSTS.Scheduling.DueDate"]);
+    const closedDate= toDateOrNull_(f["Microsoft.VSTS.Common.ClosedDate"]);
+    const activity  = f["Microsoft.VSTS.Common.Activity"] || "";
+
+    // Use calc value in math
+    const progressPct = progressPercent_(effort, remainingCalc, state);
+    const utilized    = Math.min((effort || 0), Math.max(0, (effort || 0) - (remainingCalc || 0)));
+
+    const exp = computeTicketExpected_(effort, startDate, dueDate, iteration.attributes.startDate, iteration.attributes.finishDate, teamDayOffSet);
+    const completedOverride = COMPLETED_OVERRIDE_STATES.has(stateLc);
+
+    const status = computeStatusTicketAware_({
+      state,
+      progressPct,
+      today,
+      dueDateResolved: exp.resolvedDue,
+      startDateResolved: exp.resolvedStart,
+      effort,
+      remaining: remainingCalc, // use calc
+      expectedRemaining: exp.expectedRemaining,
+      graceHours: exp.graceHours,
+      missingBothDates: exp.missingBoth,
+      usedSprintStart: exp.usedSprintStart,
+      usedSprintEnd: exp.usedSprintEnd,
+      completedOverride
+    });
+
+    // Base status note + optional missing-Remaining note
+    let statusNote = statusNarrative_(status, exp.resolvedStart, effort, remainingCalc);
+    if (r.missing && !completedOverride) {
+      statusNote = (statusNote ? (statusNote + "\n") : "") + "Remaining hours not set in DevOps.";
+    }
+
+    const us = makeUserStoryInfo(wi);
+
+    // === Column order (agreed):
+    // 0 User Story ID, 1 User Story, 2 Task ID, 3 Task Title, 4 Type, 5 Assigned To,
+    // 6 State, 7 Priority, 8 Effort, 9 Remaining, 10 Utilized,
+    // 11 Start Date, 12 Due Date, 13 Closed Date, 14 Activity,
+    // 15 Progress %, 16 Expected %, 17 Status
+    const row = [
+      us.id ? hyperlinkFormula_(adoItemUrl_(us.id), String(us.id)) : "—",
+      us.title,
+      hyperlinkFormula_(adoItemUrl_(theId), String(theId)),
+      title,
+      type,
+      assignedTo, state, priority,
+      effort, remainingDisplay, round2_(utilized),
+      asDateValue_(startDate), asDateValue_(dueDate), asDateValue_(closedDate),
+      activity, round2_(progressPct), round2_(exp.expectedPct), status
+    ];
+
+    if (typeLc === "task") { rowsTasks.push(row); notesTasks.push(statusNote); }
+    if (typeLc === "bug")  { rowsBugs.push(row);  notesBugs.push(statusNote);  }
+
+    rowsAllForDept.push(row);
+    notesAllForDept.push(statusNote);
+
+    if (assignedTo) {
+      rollup[assignedTo] = rollup[assignedTo] || { planned: 0, actual: 0, remaining: 0 };
+      rollup[assignedTo].planned   += (effort || 0);
+      rollup[assignedTo].actual    += utilized;
+      rollup[assignedTo].remaining += (remainingCalc || 0); // use calc for totals
+    }
+  }
+
+  // Sorters: User Story (A→Z, "NO PARENT ASSIGNED" last), Priority (asc), Task ID (asc numeric)
+  const sortRowsAndNotes = (rows, notes) => {
+    const pairs = rows.map((r,i)=>({r, n: notes ? notes[i] : ""}));
+    pairs.sort((A,B)=>{
+      const a=A.r, b=B.r;
+      const usA = String(a[1]||"");
+      const usB = String(b[1]||"");
+      const aNo = usA.toLowerCase() === "no parent assigned";
+      const bNo = usB.toLowerCase() === "no parent assigned";
+      if (aNo !== bNo) return aNo ? 1 : -1;
+      if (usA.toLowerCase() < usB.toLowerCase()) return -1;
+      if (usA.toLowerCase() > usB.toLowerCase()) return 1;
+      const prA = Number(a[7]||0), prB = Number(b[7]||0);
+      if (prA !== prB) return prA - prB;
+      const idA = Number(String(a[2]).match(/\d+/)?.[0]||0);
+      const idB = Number(String(b[2]).match(/\d+/)?.[0]||0);
+      return idA - idB;
+    });
+    return {
+      rows: pairs.map(p=>p.r),
+      notes: notes ? pairs.map(p=>p.n) : null
+    };
+  };
+
+  // === Write Tasks / Bugs ===
+  const headersMain = [
+    "User Story ID","User Story","Task ID","Task Title","Type","Assigned To","State","Priority",
+    "Effort","Remaining","Utilized","Start Date","Due Date","Closed Date",
+    "Activity","Progress %","Expected %","Status"
+  ];
+
+  let sorted = sortRowsAndNotes(rowsTasks, notesTasks);
+  writeResetTableWithSummary_("Tasks", sprintName, sprintStart, sprintEnd, headersMain, sorted.rows, sorted.notes);
+  applyStatusColorRulesByHeader_("Tasks", "Status", MAIN_HEADER_ROW);
+  applyPercentFormatsByHeader_("Tasks", ["Progress %","Expected %"], MAIN_HEADER_ROW);
+  // Do NOT number-format Remaining; only Effort & Utilized should be numeric
+  applyNumberFormatsByHeader_("Tasks", ["Effort","Utilized"], MAIN_HEADER_ROW);
+  enforceTextFormatByHeader_("Tasks", "Remaining", MAIN_HEADER_ROW);
+
+  sorted = sortRowsAndNotes(rowsBugs, notesBugs);
+  writeResetTableWithSummary_("Bugs", sprintName, sprintStart, sprintEnd, headersMain, sorted.rows, sorted.notes);
+  applyStatusColorRulesByHeader_("Bugs", "Status", MAIN_HEADER_ROW);
+  applyPercentFormatsByHeader_("Bugs", ["Progress %","Expected %"], MAIN_HEADER_ROW);
+  applyNumberFormatsByHeader_("Bugs", ["Effort","Utilized"], MAIN_HEADER_ROW);
+  enforceTextFormatByHeader_("Bugs", "Remaining", MAIN_HEADER_ROW);
+
+  // === Dept tabs (by Activity) – include Task + Bug + User Story
+  const byDept = {};
+  const notesByDept = {};
+  for (let i=0;i<rowsAllForDept.length;i++){
+    const r = rowsAllForDept[i];
+    const dept = (r[14] || "").toString().trim() || "No Dept Assigned";
+    if (!byDept[dept]) byDept[dept] = [];
+    if (!notesByDept[dept]) notesByDept[dept] = [];
+    byDept[dept].push(r);
+    notesByDept[dept].push(notesAllForDept[i]);
+  }
+  Object.keys(byDept).sort((a,b)=>a.localeCompare(b)).forEach(dept => {
+    const srt = sortRowsAndNotes(byDept[dept], notesByDept[dept]);
+    const tab = dept; // tab name is the Activity itself
+    writeResetTableWithSummary_(tab, sprintName, sprintStart, sprintEnd, headersMain, srt.rows, srt.notes);
+    applyStatusColorRulesByHeader_(tab, "Status", MAIN_HEADER_ROW);
+    applyPercentFormatsByHeader_(tab, ["Progress %","Expected %"], MAIN_HEADER_ROW);
+    applyNumberFormatsByHeader_(tab, ["Effort","Utilized"], MAIN_HEADER_ROW);
+    enforceTextFormatByHeader_(tab, "Remaining", MAIN_HEADER_ROW);
+  });
+
+  // === Resource Summary (per-person, no per-day matrix here)
+  const resRows = [];
+  const allPeople = new Set(Object.keys(rollup).concat(Object.keys(capacityByUser)));
+  for (const person of allPeople) {
+    const r = rollup[person] || { planned: 0, actual: 0, remaining: 0 };
+    const capObj = capacityByUser[person] || {
+      capacityPerDay: 0, workingDays: workingDates.length, daysOffCount: 0, effectiveCapacity: 0
+    };
+    const planned = r.planned, actual = r.actual, remaining = r.remaining, effCap = capObj.effectiveCapacity || 0;
+    const progressPctPerson = planned > 0 ? (actual/planned*100) : 0;
+    const allocationPct     = effCap > 0 ? (planned/effCap*100) : "—";
+    const utilizationPct    = effCap > 0 ? (actual/effCap*100) : "—";
+
+    resRows.push([
+      person, sprintName,
+      round2_(capObj.capacityPerDay || 0),
+      capObj.workingDays || 0,
+      capObj.daysOffCount || 0,
+      round2_(effCap),
+      round2_(planned),
+      round2_(actual),
+      round2_(remaining),
+      round2_(progressPctPerson),
+      (typeof allocationPct === "number" ? round2_(allocationPct) : "—"),
+      (typeof utilizationPct === "number" ? round2_(utilizationPct) : "—")
+    ]);
+  }
+
+  const resHeaders = [
+    "Resource","Sprint","Capacity per Day (hrs)","Working Days","Days Off (days)","Effective Sprint Capacity (hrs)",
+    "Planned Hours/Assigned Task Hours (Σ Effort)","Actual Hours Spent (Σ Utilized)","Remaining Hours (Σ Remaining)",
+    "Progress % (Actual/Planned)","Allocation % (Planned/Capacity)","Utilization % (Actual/Capacity)"
+  ];
+  writeResetTableWithSummary_("Resource Summary", sprintName, sprintStart, sprintEnd, resHeaders, sortBy_(resRows, 0));
+  applyPercentFormatsByHeader_("Resource Summary", [
+    "Progress % (Actual/Planned)","Allocation % (Planned/Capacity)","Utilization % (Actual/Capacity)"], MAIN_HEADER_ROW);
+  applyNumberFormatsByHeader_("Resource Summary", [
+    "Capacity per Day (hrs)","Working Days","Effective Sprint Capacity (hrs)",
+    "Planned Hours/Assigned Task Hours (Σ Effort)","Actual Hours Spent (Σ Utilized)","Remaining Hours (Σ Remaining)"], MAIN_HEADER_ROW);
+
+  // === Capacity (Per-Day) — keep hidden for power users (Option A)
+  buildCapacityPerDayFromApi_("Capacity (Per-Day)", workingDates, capacityByUser, rollup);
+  const capSheet = SpreadsheetApp.getActive().getSheetByName("Capacity (Per-Day)");
+  if (capSheet) capSheet.hideSheet(); // keep hidden as agreed
+}
+
+/** ============== Iteration lookup helpers (timeframe-safe) ============== **/
+function safeGetCurrentIteration_(cfg) {
+  try { return getCurrentIteration_(cfg); } catch(e) { return null; }
+}
+
+function safeGetPastIterations_(cfg, count) {
+  const all = listAllTeamIterations_(cfg);
+  if (!all.length) return [];
+  let currentId = null;
+  try { const cur = getCurrentIteration_(cfg); currentId = cur && cur.id; } catch (e) {}
+  const now = new Date();
+  const past = all.filter(it => new Date(it.attributes.finishDate) < now && it.id !== currentId);
+  past.sort((a,b)=> new Date(b.attributes.startDate) - new Date(a.attributes.startDate));
+  return past.slice(0, Math.max(0, count));
+}
+
+// Pagination-safe
+function listAllTeamIterations_(cfg) {
+  const base = `https://dev.azure.com/${enc(cfg.org)}/${enc(cfg.projectId)}/${enc(cfg.team)}` +
+               `/_apis/work/teamsettings/iterations?api-version=7.1-preview.1`;
+  let url = base, out = [];
+  while (true) {
+    const resp = UrlFetchApp.fetch(url, {
+      method: "GET",
+      headers: {
+        "Authorization": "Basic " + Utilities.base64Encode(":" + cfg.pat)
+      },
+      muteHttpExceptions: true
+    });
+    const code = resp.getResponseCode();
+    const text = resp.getContentText() || "";
+    if (code < 200 || code >= 300) throw new Error(`Iterations failed (${code}): ${text}`);
+    const data = text ? JSON.parse(text) : {};
+    out = out.concat(data.value || []);
+    const headers = resp.getHeaders() || {};
+    const tok = headers['x-ms-continuationtoken'] || headers['X-MS-ContinuationToken'];
+    if (!tok) break;
+    url = base + `&continuationToken=${encodeURIComponent(tok)}`;
+  }
+  return out;
+}
+
+function getCurrentIteration_(cfg) {
+  const url = `https://dev.azure.com/${enc(cfg.org)}/${enc(cfg.projectId)}/${enc(cfg.team)}` +
+              `/_apis/work/teamsettings/iterations?$timeframe=current&api-version=7.1-preview.1`;
+  const res = adoFetch_(cfg, url, "GET");
+  const list = res.value || [];
+  if (!list.length) throw new Error("No current iteration found. Check your Team selection in DevOps.");
+  return list[0];
+}
+
+/** ============== DevOps API & Work Items ============== **/
+function getTeamDaysOff_(cfg, iterationId) {
+  const url = `https://dev.azure.com/${enc(cfg.org)}/${enc(cfg.projectId)}/${enc(cfg.team)}` +
+              `/_apis/work/teamsettings/iterations/${enc(iterationId)}/teamdaysoff?api-version=7.1-preview.1`;
+  const res = adoFetch_(cfg, url, "GET");
+  const ranges = (res.daysOff || []).flatMap(r => expandDateRange_(r.start, r.end));
+  return new Set(ranges.map(d => fmtDateKey_(d)));
+}
+
+function getCapacityByUser_(cfg, iterationId, sprintStart, sprintEnd, teamDayOffSet) {
+  const url = `https://dev.azure.com/${enc(cfg.org)}/${enc(cfg.projectId)}/${enc(cfg.team)}` +
+              `/_apis/work/teamsettings/iterations/${enc(iterationId)}/capacities?api-version=7.1-preview.1`;
+  const res = adoFetch_(cfg, url, "GET");
+  const values = res.value || [];
+  const workingDates = enumerateWorkingDatesTeamAware_(sprintStart, sprintEnd, teamDayOffSet);
+
+  const out = {};
+  for (const entry of values) {
+    const member = entry.teamMember || {};
+    const name = canonicalName_(member.displayName || member.uniqueName || "");
+    if (!name) continue;
+
+    let capacityPerDay = 0;
+    for (const a of (entry.activities || [])) capacityPerDay += toNumber_(a.capacityPerDay);
+
+    const personalDays = (entry.daysOff || []).flatMap(r => expandDateRange_(r.start, r.end))
+                        .filter(isWeekday_).map(fmtDateKey_);
+    const personalOffSet = new Set(personalDays);
+
+    let effectiveDays = 0;
+    for (const d of workingDates) if (!personalOffSet.has(fmtDateKey_(d))) effectiveDays++;
+    const effectiveCapacity = round2_(capacityPerDay * effectiveDays);
+
+    out[name] = {
+      capacityPerDay: round2_(capacityPerDay),
+      workingDays: workingDates.length,
+      daysOffCount: personalOffSet.size,
+      effectiveCapacity,
+      workingDates,
+      personalOffSet
+    };
+  }
+  return out;
+}
+
+function queryWorkItemIdsForIteration_(cfg, iterationPath, types) {
+  const typesClause = types.map(t => `'${t}'`).join(",");
+  const wiql = {
+    query:
+      `SELECT [System.Id] FROM WorkItems ` +
+      `WHERE [System.IterationPath] UNDER '${escapeQuotes_(iterationPath)}' ` +
+      `AND [System.WorkItemType] IN (${typesClause})`
+  };
+  const url = `https://dev.azure.com/${enc(cfg.org)}/${enc(cfg.projectId)}` +
+              `/_apis/wit/wiql?api-version=7.1-preview.2`;
+  const res = adoFetch_(cfg, url, "POST", wiql);
+  const workItems = res.workItems || [];
+  return workItems.map(w => w.id);
+}
+
+function fetchWorkItemsBatch_(cfg, ids, fields) {
+  if (!ids || !ids.length) return [];
+  const chunks = chunk_(ids, 180);
+  const out = [];
+  for (const group of chunks) {
+    const url = `https://dev.azure.com/${enc(cfg.org)}/${enc(cfg.projectId)}` +
+                `/_apis/wit/workitemsbatch?api-version=7.1-preview.1`;
+    const payload = { ids: group, fields: fields };
+    const res = adoFetch_(cfg, url, "POST", payload);
+    const values = res.value || [];
+    const byId = {};
+    for (const it of values) byId[it.id] = it;
+    for (const id of group) if (byId[id]) out.push(byId[id]);
+  }
+  return out;
+}
+
+function adoFetch_(cfg, url, method, payload) {
+  const headers = {
+    "Content-Type": "application/json",
+    "Authorization": "Basic " + Utilities.base64Encode(":" + cfg.pat)
+  };
+  const params = { method: method || "GET", headers, muteHttpExceptions: true };
+  if (payload != null) params.payload = JSON.stringify(payload);
+
+  const resp = UrlFetchApp.fetch(url, params);
+  const code = resp.getResponseCode();
+  const text = resp.getContentText();
+  if (code >= 200 && code < 300) return text ? JSON.parse(text) : {};
+  throw new Error(`ADO ${method || "GET"} failed (${code}): ${text}`);
+}
+
+/** ============== Calculations & Dates ============== **/
+
+function computeTicketExpected_(effort, startDate, dueDate, sprintStartISO, sprintEndISO, teamDayOffSet) {
+  const today = todayMidnight_();
+  const hasStart = !!startDate && !isNaN(new Date(startDate).getTime());
+  const hasDue   = !!dueDate   && !isNaN(new Date(dueDate).getTime());
+
+  if (!hasStart && !hasDue) {
+    return {
+      expectedPct: 0,
+      expectedRemaining: round2_(toNumber_(effort)),
+      graceHours: 0,
+      resolvedStart: null,
+      resolvedDue: null,
+      usedSprintStart: false,
+      usedSprintEnd: false,
+      missingBoth: true
+    };
+  }
+
+  let usedSprintStart = false, usedSprintEnd = false;
+  const sprintStart = new Date(sprintStartISO);
+  const sprintEnd   = new Date(sprintEndISO);
+
+  const start = hasStart ? new Date(startDate) : (usedSprintStart = true, new Date(sprintStart));
+  const due   = hasDue   ? new Date(dueDate)   : (usedSprintEnd   = true, new Date(sprintEnd));
+
+  start.setHours(0,0,0,0);
+  due.setHours(0,0,0,0);
+
+  const dates = [];
+  for (let d = new Date(start); d <= due; d = addDays_(d, 1)) {
+    if (isWeekday_(d) && !teamDayOffSet.has(fmtDateKey_(d))) dates.push(new Date(d));
+  }
+
+  const totalDays = Math.max(1, dates.length);
+  const daysElapsed = dates.filter(d => d <= today).length;
+
+  const eff = toNumber_(effort);
+  const pacePerDay = eff / totalDays;
+  const burnedExpected = pacePerDay * daysElapsed;
+
+  return {
+    expectedPct: round2_(Math.min(100, Math.max(0, (daysElapsed / totalDays) * 100))),
+    expectedRemaining: round2_(Math.max(0, eff - burnedExpected)),
+    graceHours: round2_(pacePerDay),
+    resolvedStart: start,
+    resolvedDue: due,
+    usedSprintStart,
+    usedSprintEnd,
+    missingBoth: false
+  };
+}
+
+function computeStatusTicketAware_({
+  state, progressPct, today, dueDateResolved, startDateResolved, effort, remaining, expectedRemaining, graceHours,
+  missingBothDates, usedSprintStart, usedSprintEnd, completedOverride
+}) {
+  if (completedOverride) return "Completed!";
+  const st = (state || "").toLowerCase();
+  if (missingBothDates) return "Values Missing (no start/due)";
+  if (st === "done" || progressPct >= 99) return "Completed";
+  if (ymd_(dueDateResolved) < ymd_(today)) return "Overdue";
+
+  // Planned / Yet to start (exact definitions)
+  const eff = toNumber_(effort);
+  const rem = toNumber_(remaining);
+  if (eff > 0 && eff === rem && startDateResolved instanceof Date) {
+    const t = ymd_(today), s = ymd_(startDateResolved);
+    if (t < s)  return "Planned to start";
+    else        return "Yet to start";
+  }
+
+  // On Track / At Risk
+  const threshold = (expectedRemaining || 0) + (graceHours || 0);
+  let label = (rem > threshold) ? "At Risk" : "On Track";
+
+  const hints = [];
+  if (usedSprintStart) hints.push("used sprint start");
+  if (usedSprintEnd)   hints.push("used sprint end");
+  if (hints.length) label += ` (${hints.join(", ")})`;
+  return label;
+}
+
+function statusNarrative_(label, startDate, effort, remaining) {
+  const eff = toNumber_(effort);
+  const rem = toNumber_(remaining);
+  const burned = Math.max(0, eff - rem);
+  const dStr = startDate instanceof Date ? startDate.toDateString() : "N/A";
+  if (label === "Planned to start") {
+    return `Planned to start — starts on ${dStr}. ${burned}/${eff}h burned.`;
+  }
+  if (label === "Yet to start") {
+    return `Yet to start — should have started on ${dStr}. ${rem}/${eff}h still unburned.`;
+  }
+  return "";
+}
+
+function progressPercent_(effort, remaining, state) {
+  const st = (state || "").toLowerCase();
+  if (!effort && st === "done") return 100;
+  if (!effort) return 0;
+  const used = Math.max(0, (effort || 0) - (remaining || 0));
+  return Math.min(100, Math.max(0, (used / effort) * 100));
+}
+
+function expectedPercentWorkingDays_(today, workingDates) {
+  if (!workingDates || !workingDates.length) return 0;
+  const t = new Date(today); t.setHours(0,0,0,0);
+  const elapsed = workingDates.filter(d => d <= t).length;
+  return Math.min(100, Math.max(0, (elapsed / workingDates.length) * 100));
+}
+
+function enumerateWorkingDatesTeamAware_(start, end, teamDayOffSet) {
+  const out = [];
+  const s = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+  const e = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  for (let d = s; d <= e; d = addDays_(d, 1)) {
+    const dd = new Date(d);
+    if (isWeekday_(dd) && !teamDayOffSet.has(fmtDateKey_(dd))) out.push(dd);
+  }
+  return out;
+}
+
+/** ============== Sheets: write & style (row-6 headers) ============== **/
+function writeResetTableWithSummary_(sheetName, sprintName, sprintStart, sprintEnd, headers, rows, statusNotes) {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+  sh.clearFormats(); sh.clearContents();
+
+  // Summary block
+  sh.getRange(1,1,4,2).setValues([
+    ["Sprint",        sprintName],
+    ["Start",         new Date(sprintStart)],
+    ["End",           new Date(sprintEnd)],
+    ["Last Updated",  new Date().toLocaleString("en-GB")]
+  ]);
+  sh.getRange(1,1,4,1).setFontWeight("bold");
+  sh.getRange(1,1,4,2).setBorder(true,true,true,true,true,true);
+
+  // Header row
+  sh.getRange(MAIN_HEADER_ROW, 1, 1, headers.length).setValues([headers]);
+  styleHeaderRowAt_(sheetName, MAIN_HEADER_ROW);
+  wrapHeaderFirstColAt_(sheetName, MAIN_HEADER_ROW);
+
+  // Body
+  if (rows && rows.length) sh.getRange(MAIN_HEADER_ROW+1, 1, rows.length, headers.length).setValues(rows);
+
+  // Notes aligned to rows
+  if (statusNotes && statusNotes.length) {
+    setStatusNotesAligned_(sheetName, MAIN_HEADER_ROW, statusNotes);
+  } else {
+    // clear any old notes in Status column
+    const H = headerIndexMapAt_(sh, MAIN_HEADER_ROW);
+    const idx = H["Status"];
+    if (idx != null && sh.getLastRow() > MAIN_HEADER_ROW) {
+      sh.getRange(MAIN_HEADER_ROW+1, idx+1, sh.getLastRow()-MAIN_HEADER_ROW, 1).clearNote();
+    }
+  }
+
+  // Auto resize
+  sh.autoResizeColumns(1, Math.max(1, headers.length));
+}
+
+function setStatusNotesAligned_(sheetName, headerRow, notesArray) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
+  if (!sh || !notesArray || !notesArray.length) return;
+  const H = headerIndexMapAt_(sh, headerRow);
+  const idx = H["Status"];
+  if (idx == null) return;
+
+  const usedRows = Math.max(0, sh.getLastRow() - headerRow);
+  if (usedRows > 0) sh.getRange(headerRow + 1, idx + 1, usedRows, 1).clearNote();
+
+  const n = notesArray.length;
+  const matrix = notesArray.map(s => [s || ""]);
+  sh.getRange(headerRow + 1, idx + 1, n, 1).setNotes(matrix);
+}
+
+function styleHeaderRowAt_(sheetName, headerRow) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
+  if (!sh) return;
+  const lastCol = Math.max(1, sh.getLastColumn());
+  sh.setFrozenRows(headerRow);
+  const header = sh.getRange(headerRow, 1, 1, lastCol);
+  header.setBackground(THEME_HEADER_BG).setFontWeight("bold").setHorizontalAlignment("center");
+  const bandings = sh.getBandings ? sh.getBandings() : [];
+  bandings.forEach(b => b.remove());
+  const lastRow = Math.max(headerRow, sh.getLastRow());
+  sh.getRange(1, 1, lastRow, lastCol).setBorder(true, true, true, true, true, true);
+}
+
+function wrapHeaderFirstColAt_(sheetName, headerRow) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
+  if (!sh) return;
+  sh.getRange(headerRow,1,1,1).setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP);
+}
+
+// Back-compat shims (used in Selector sheet)
+function styleHeaderRow_(sheetName) { styleHeaderRowAt_(sheetName, 1); }
+function wrapHeaderFirstCol_(sheetName) { wrapHeaderFirstColAt_(sheetName, 1); }
+
+// Replace the whole function with this version
+function applyStatusColorRulesAt_(sheetName, statusColIndex, headerRow) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
+  if (!sh) return;
+  const lastRow = Math.max(headerRow + 1, sh.getLastRow());
+  if (lastRow <= headerRow) return;
+
+  const statusRange = sh.getRange(headerRow + 1, statusColIndex, lastRow - headerRow, 1);
+  const existing = sh.getConditionalFormatRules() || [];
+  const keep = existing.filter(r => {
+    const ranges = r.getRanges().map(x => x.getA1Notation()).join(",");
+    return !ranges.includes(statusRange.getA1Notation());
+  });
+
+  const rules = [
+    // high-urgency first
+    SpreadsheetApp.newConditionalFormatRule().setRanges([statusRange])
+      .whenTextEqualTo("Overdue")
+      .setBackground("#f44336").setFontColor("#ffffff").build(),
+
+    // success
+    SpreadsheetApp.newConditionalFormatRule().setRanges([statusRange])
+      .whenTextContains("Completed")
+      .setBackground("#388e3c").setFontColor("#ffffff").build(),
+
+    // steady
+    SpreadsheetApp.newConditionalFormatRule().setRanges([statusRange])
+      .whenTextContains("On Track")
+      .setBackground("#1e88e5").setFontColor("#ffffff").build(),
+
+    // warning
+    SpreadsheetApp.newConditionalFormatRule().setRanges([statusRange])
+      .whenTextEqualTo("At Risk")
+      .setBackground("#f9a825").setFontColor("#000000").build(),
+
+    // NEW: planned but not started yet (future start date)
+    SpreadsheetApp.newConditionalFormatRule().setRanges([statusRange])
+      .whenTextEqualTo("Planned to start")
+      .setBackground("#8e24aa").setFontColor("#ffffff").build(),
+
+    // NEW: should’ve started, still untouched
+    SpreadsheetApp.newConditionalFormatRule().setRanges([statusRange])
+      .whenTextEqualTo("Yet to start")
+      .setBackground("#546e7a").setFontColor("#ffffff").build(),
+
+    // data gap
+    SpreadsheetApp.newConditionalFormatRule().setRanges([statusRange])
+      .whenTextContains("Values Missing")
+      .setBackground("#9e9e9e").setFontColor("#ffffff").build()
+  ];
+
+  sh.setConditionalFormatRules(keep.concat(rules));
+}
+
+
+function applyStatusColorRulesByHeader_(sheetName, headerName, headerRow) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
+  if (!sh) return;
+  const H = headerIndexMapAt_(sh, headerRow);
+  const idx = H[headerName];
+  if (idx == null) return;
+  applyStatusColorRulesAt_(sheetName, idx+1, headerRow);
+}
+
+// percent formatting (literal %), header-aware
+function applyPercentFormatsByHeader_(sheetName, headerNames, headerRow) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
+  if (!sh) return;
+  const H = headerIndexMapAt_(sh, headerRow);
+  const lastRow = sh.getLastRow();
+  if (lastRow <= headerRow) return;
+  headerNames.forEach(h=>{
+    const idx = H[h];
+    if (idx == null) return;
+    sh.getRange(headerRow+1, idx+1, lastRow-headerRow, 1).setNumberFormat('0.00"%"');
+  });
+}
+
+// numeric formatting by header name
+function applyNumberFormatsByHeader_(sheetName, headerNames, headerRow) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
+  if (!sh) return;
+  const H = headerIndexMapAt_(sh, headerRow);
+  const lastRow = sh.getLastRow();
+  if (lastRow <= headerRow) return;
+  headerNames.forEach(h=>{
+    const idx = H[h];
+    if (idx == null) return;
+    sh.getRange(headerRow+1, idx+1, lastRow-headerRow, 1).setNumberFormat("0.00");
+  });
+}
+
+// Legacy (index-based) — still used in a few places
+function applyPercentFormats_(sheetName, colIndexList) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
+  if (!sh || !colIndexList || !colIndexList.length) return;
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return;
+  colIndexList.forEach(ci => sh.getRange(2, ci, lastRow - 1, 1).setNumberFormat('0.00"%"'));
+}
+function applyNumberFormats_(sheetName, colIndexList) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
+  if (!sh || !colIndexList || !colIndexList.length) return;
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return;
+  colIndexList.forEach(ci => sh.getRange(2, ci, lastRow - 1, 1).setNumberFormat("0.00"));
+}
+
+/** ============== Capacity (Per-Day) builder (hidden) ============== **/
+function buildCapacityPerDayFromApi_(tabName, workingDates, capacityByUser, rollup) {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(tabName) || ss.insertSheet(tabName);
+  sh.clearFormats();
+  sh.clearContents();
+
+  // Summary block
+  sh.getRange(1,1,4,2).setValues([
+    ["Sprint",        ""],
+    ["Start",         ""],
+    ["End",           ""],
+    ["Last Updated",  new Date().toLocaleString("en-GB")]
+  ]);
+  sh.getRange(1,1,4,1).setFontWeight("bold");
+  sh.getRange(1,1,4,2).setBorder(true,true,true,true,true,true);
+
+  const dateFmt = (d)=> Utilities.formatDate(d, Session.getScriptTimeZone(), "EEE dd-MMM");
+  const dateHeaders = workingDates.map(dateFmt);
+  const headers = ["Name of Resource","Role","Capacity per Day (hrs)"]
+                  .concat(dateHeaders)
+                  .concat(["Effective Sprint Capacity","Planned Hours","Allocation % (planned/capacity)","Utilization Rate (actual/capacity)","Actual Hours Spent","Remaining Hours","% Progress"]);
+
+  sh.getRange(MAIN_HEADER_ROW,1,1,headers.length).setValues([headers]);
+  styleHeaderRowAt_(tabName, MAIN_HEADER_ROW);
+  wrapHeaderFirstColAt_(tabName, MAIN_HEADER_ROW);
+
+  const unionNames = new Set(Object.keys(capacityByUser).concat(Object.keys(rollup || {})));
+  const people = Array.from(unionNames).sort((a,b)=>a.localeCompare(b));
+  const rows = [];
+
+  for (const person of people) {
+    const cap = capacityByUser[person] || {};
+    const capPerDay = (cap.capacityPerDay != null) ? cap.capacityPerDay : null; // may be null
+    const personalOff = cap.personalOffSet || new Set();
+
+    const perDay = workingDates.map(d => personalOff.has(fmtDateKey_(d)) ? 0 : (capPerDay ?? 0));
+
+    const r = rollup[person] || { planned: 0, actual: 0, remaining: 0 };
+    const planned = round2_(r.planned), actual = round2_(r.actual), remaining = round2_(r.remaining);
+
+    const effCap  = (cap.effectiveCapacity != null)
+      ? round2_(cap.effectiveCapacity)
+      : round2_(perDay.reduce((a,b)=>a+b,0));
+
+    const allocation = (effCap && effCap > 0) ? round2_(planned/effCap*100) : "—";
+    const utilRate   = (effCap && effCap > 0) ? round2_(actual /effCap*100) : "—";
+    const progress   = planned ? round2_(actual/planned*100) : 0;
+
+    const capacityCell = (capPerDay != null) ? round2_(capPerDay) : "—";
+
+    rows.push([person,"", capacityCell].concat(perDay).concat([effCap, planned, allocation, utilRate, actual, remaining, progress]));
+  }
+
+  if (rows.length) sh.getRange(MAIN_HEADER_ROW+1,1,rows.length,headers.length).setValues(rows);
+  sh.autoResizeColumns(1, headers.length);
+
+  // Header-safe % formatting
+  applyPercentFormatsByHeader_(tabName, [
+    "Allocation % (planned/capacity)",
+    "Utilization Rate (actual/capacity)",
+    "% Progress"
+  ], MAIN_HEADER_ROW);
+
+  // Numeric formatting for non-% columns
+  applyNumberFormatsByHeader_(tabName, [
+    "Capacity per Day (hrs)",
+    "Effective Sprint Capacity",
+    "Planned Hours",
+    "Actual Hours Spent",
+    "Remaining Hours"
+  ], MAIN_HEADER_ROW);
+
+  // Per-day date columns
+  const lastCol = sh.getLastColumn();
+  const firstDateCol = 4;           // Name, Role, Capacity = 1..3
+  const trailingSummaryCols = 7;    // EffectiveCap..% Progress = 7
+  const lastDateCol = lastCol - trailingSummaryCols;
+  const lastRow = sh.getLastRow();
+  if (lastRow > MAIN_HEADER_ROW && lastDateCol >= firstDateCol) {
+    sh.getRange(MAIN_HEADER_ROW+1, firstDateCol, lastRow-MAIN_HEADER_ROW, lastDateCol-firstDateCol+1).setNumberFormat("0.00");
+  }
+}
+
+/** ============== DAILY SNAPSHOT & UTILIZATION (timestamp-aware) ============== **/
+
+function snapshotRemainingLog_Current() {
+  const cfg = { org: ADO_ORG, projectId: ADO_PROJECT_ID, team: ADO_TEAM, pat: ADO_PAT };
+  const iteration = getCurrentIteration_(cfg);
+  const sprintPath = iteration.path;
+
+  const ids = queryWorkItemIdsForIteration_(cfg, sprintPath, ["Task","Bug"]);
+  const fields = [
+    "System.Id","System.Title","System.WorkItemType","System.State",
+    "System.AssignedTo","Microsoft.VSTS.Scheduling.RemainingWork",
+    "Microsoft.VSTS.Common.ClosedDate"
+  ];
+  const items = fetchWorkItemsBatch_(cfg, ids, fields);
+
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName("Remaining_Log") || ss.insertSheet("Remaining_Log");
+
+  // Ensure summary + header exists
+  const headers = [
+    "Snapshot At","Date","Work Item ID","Title","Assigned To","Remaining (hrs)",
+    "Hours Spent Since Last","Scope Added Since Last (hrs)",
+    "Type","State","Closed Date"
+  ];
+  if (sh.getLastRow() < MAIN_HEADER_ROW) {
+    sh.clear();
+    sh.getRange(1,1,4,2).setValues([
+      ["Sprint", iteration.name],
+      ["Start",  new Date(iteration.attributes.startDate)],
+      ["End",    new Date(iteration.attributes.finishDate)],
+      ["Last Updated", new Date().toLocaleString("en-GB")]
+    ]);
+    sh.getRange(1,1,4,1).setFontWeight("bold");
+    sh.getRange(1,1,4,2).setBorder(true,true,true,true,true,true);
+    sh.getRange(MAIN_HEADER_ROW,1,1,headers.length).setValues([headers]);
+    styleHeaderRowAt_("Remaining_Log", MAIN_HEADER_ROW);
+    wrapHeaderFirstColAt_("Remaining_Log", MAIN_HEADER_ROW);
+  }
+
+  const nowTs = new Date();
+  const today = todayMidnight_();
+  const rows = [];
+  for (const wi of items) {
+    const f = wi.fields || {};
+    const id = String(wi.id || "");
+    const title = f["System.Title"] || "";
+    const type = f["System.WorkItemType"] || "";
+    const state = f["System.State"] || "";
+    const closed = asDateValue_(toDateOrNull_(f["Microsoft.VSTS.Common.ClosedDate"]));
+    const assignedTo = extractAssignee_(f["System.AssignedTo"]);
+    let remaining = toNumber_(f["Microsoft.VSTS.Scheduling.RemainingWork"]);
+    if (closed && closed instanceof Date && ymd_(closed) <= ymd_(today)) remaining = 0;
+    rows.push([
+      nowTs, asDateValue_(today), id, title, assignedTo, remaining,
+      "", "", type, state, closed
+    ]);
+  }
+
+  // Build last-remaining map AFTER ensuring header exists
+  const H = headerIndexMapAt_(sh, MAIN_HEADER_ROW);
+  const lastMap = buildLastRemainingMap_(sh, H);
+
+  // calculate deltas
+  const idIdx = 2, remainingIdx = 5;
+  for (let i=0;i<rows.length;i++){
+    const id = rows[i][idIdx];
+    const remaining = toNumber_(rows[i][remainingIdx]);
+    const prev = lastMap[id] != null ? lastMap[id] : remaining;
+    const delta = round2_((prev || 0) - (remaining || 0));
+    rows[i][6] = Math.max(0, delta);    // Hours Spent Since Last
+    rows[i][7] = Math.max(0, -delta);   // Scope Added Since Last (hrs)
+  }
+
+  if (rows.length) {
+    const startRow = Math.max(MAIN_HEADER_ROW+1, sh.getLastRow()+1);
+    sh.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows);
+  }
+
+  // Hide by default (visibility only, not security)
+  sh.hideSheet();
+}
+
+function runDailyUtilizationReport_Current() {
+  const cfg = { org: ADO_ORG, projectId: ADO_PROJECT_ID, team: ADO_TEAM, pat: ADO_PAT };
+  const iteration = getCurrentIteration_(cfg);
+  const sprintName = iteration.name;
+  const sprintStart = new Date(iteration.attributes.startDate);
+  const sprintEnd   = new Date(iteration.attributes.finishDate);
+  const teamDayOffSet = getTeamDaysOff_(cfg, iteration.id);
+  const capacityByUser = getCapacityByUser_(cfg, iteration.id, sprintStart, sprintEnd, teamDayOffSet);
+  buildDailyUtilizationFromLog_(sprintName, sprintStart, sprintEnd, capacityByUser);
+}
+
+function runDailyUtilizationReport_Selected() {
+  const cfg = { org: ADO_ORG, projectId: ADO_PROJECT_ID, team: ADO_TEAM, pat: ADO_PAT };
+  const ss = SpreadsheetApp.getActive();
+  const sel = ss.getSheetByName(SHEET_SELECTOR);
+  const idx = ss.getSheetByName(SHEET_INDEX);
+  if (!sel || !idx) throw new Error("Please run setupSprintSelector() first.");
+
+  const Hsel = headerIndexMap_(sel);
+  const pickCol = (Hsel["Pick a sprint name"] != null) ? (Hsel["Pick a sprint name"] + 1) : 2;
+  const name = (sel.getRange(2, pickCol).getDisplayValue() || "").trim();
+  if (!name || name === "No sprints found") throw new Error("No sprint selected.");
+
+  const rows = idx.getRange(2,1,Math.max(0, idx.getLastRow()-1),5).getValues();
+  const rec = rows.find(r => String(r[0]).trim() === name);
+  if (!rec) throw new Error("Selected sprint not found.");
+
+  const iteration = {
+    name: rec[0], id: rec[1], path: rec[2],
+    attributes: { startDate: rec[3], finishDate: rec[4] }
+  };
+
+  const teamDayOffSet = getTeamDaysOff_(cfg, iteration.id);
+  const capacityByUser = getCapacityByUser_(cfg, iteration.id, new Date(rec[3]), new Date(rec[4]), teamDayOffSet);
+
+  buildDailyUtilizationFromLog_(iteration.name, new Date(rec[3]), new Date(rec[4]), capacityByUser);
+}
+
+// Unknown capacity → "—" (N/A)
+function buildDailyUtilizationFromLog_(sprintName, sprintStart, sprintEnd, capacityByUser) {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName("Daily Utilization") || ss.insertSheet("Daily Utilization");
+
+  const headers = [
+    "Snapshot At","Person","Sprint",
+    "Total Tasks Assigned","Total Bugs Assigned",
+    "Tickets Touched (Latest Snapshot)","Hours Spent (Since Prev Snapshot)","Scope Added (hrs)","Net Burn (hrs)","Tickets Closed (Today)",
+    "Available Hours (Today)","Utilization %","Bug Hour Ratio %"
+  ];
+
+  // summary + header
+  sh.clearFormats(); sh.clearContents();
+  sh.getRange(1,1,4,2).setValues([
+    ["Sprint", sprintName],
+    ["Start", sprintStart],
+    ["End",   sprintEnd],
+    ["Last Updated", new Date().toLocaleString("en-GB")]
+  ]);
+  sh.getRange(1,1,4,1).setFontWeight("bold");
+  sh.getRange(1,1,4,2).setBorder(true,true,true,true,true,true);
+  sh.getRange(MAIN_HEADER_ROW,1,1,headers.length).setValues([headers]);
+  styleHeaderRowAt_("Daily Utilization", MAIN_HEADER_ROW);
+  wrapHeaderFirstColAt_("Daily Utilization", MAIN_HEADER_ROW);
+
+  const log = ss.getSheetByName("Remaining_Log");
+  if (!log || log.getLastRow() <= MAIN_HEADER_ROW) throw new Error("Remaining_Log is empty. Take a snapshot first.");
+
+  const H = headerIndexMapAt_(log, MAIN_HEADER_ROW);
+  const vals = log.getRange(MAIN_HEADER_ROW+1,1, log.getLastRow()-MAIN_HEADER_ROW, log.getLastColumn()).getValues();
+
+  const tsIdx = H["Snapshot At"] != null ? H["Snapshot At"] : H["Date"];
+  if (tsIdx == null) throw new Error("Remaining_Log missing 'Snapshot At' or 'Date' header.");
+
+  let latestTs = null;
+  for (const r of vals) {
+    const ts = r[tsIdx];
+    if (ts && ts instanceof Date && (!latestTs || ts > latestTs)) latestTs = ts;
+  }
+  if (!latestTs) throw new Error("No valid snapshot timestamps found.");
+
+  const isSameTs = (d) => (d instanceof Date) && (d.getTime() === latestTs.getTime());
+  const todayRows = vals.filter(r => isSameTs(r[tsIdx]));
+  const todayKey = fmtDateKey_(latestTs);
+
+  const per = {};
+  const touchedByPerson = {};
+  const idIdx = H["Work Item ID"], assignedIdx = H["Assigned To"], spentIdx = H["Hours Spent Since Last"],
+        scopeIdx = H["Scope Added Since Last (hrs)"], typeIdx = H["Type"], closedIdx = H["Closed Date"];
+
+  for (const r of todayRows) {
+    const id = String(r[idIdx]);
+    const person = canonicalName_(r[assignedIdx] || "");
+    const spent = toNumber_(r[spentIdx]);
+    const scopeAdded = toNumber_(r[scopeIdx]);
+    const type = (r[typeIdx] || "").toString().toLowerCase();
+    const closed = r[closedIdx];
+
+    if (!per[person]) per[person] = { tasks:0, bugs:0, touched:0, spent:0, scope:0, closed:0, bugHours:0 };
+    if (!touchedByPerson[person]) touchedByPerson[person] = new Set();
+    touchedByPerson[person].add(id);
+
+    per[person].spent += spent;
+    per[person].scope += scopeAdded;
+    per[person].closed += (closed && closed instanceof Date && fmtDateKey_(closed) === todayKey) ? 1 : 0;
+    if (type === "bug") per[person].bugHours += spent;
+  }
+
+  // Assigned counts from Tasks/Bugs sheets (header-aware)
+  const assigned = (() => {
+    const counts = {};
+    const readTab = (name) => {
+      const tab = ss.getSheetByName(name);
+      if (!tab || tab.getLastRow() <= MAIN_HEADER_ROW) return;
+      const Ht = headerIndexMapAt_(tab, MAIN_HEADER_ROW);
+      const vals2 = tab.getRange(MAIN_HEADER_ROW+1,1, tab.getLastRow()-MAIN_HEADER_ROW, tab.getLastColumn()).getValues();
+      const typeIdx = Ht["Type"], personIdx = Ht["Assigned To"];
+      for (const v of vals2) {
+        const person = canonicalName_(v[personIdx] || "");
+        if (!person) continue;
+        if (!counts[person]) counts[person] = {tasks:0, bugs:0};
+        const t = (v[typeIdx]||"").toString().toLowerCase();
+        if (t==="task") counts[person].tasks++;
+        if (t==="bug")  counts[person].bugs++;
+      }
+    };
+    readTab("Tasks");
+    readTab("Bugs");
+    return counts;
+  })();
+
+  const out = [];
+  const people = new Set([...Object.keys(capacityByUser), ...Object.keys(per), ...Object.keys(assigned)]);
+  for (const person of people) {
+    const capObj = capacityByUser[person] || {};
+    const isWorkingDay = capObj.workingDates ? capObj.workingDates.some(d => fmtDateKey_(d) === todayKey) : false;
+    const isPersonalOff = capObj.personalOffSet ? capObj.personalOffSet.has(todayKey) : false;
+
+    const baseAvail = (isWorkingDay && !isPersonalOff) ? (capObj.capacityPerDay ?? null) : 0;
+    const available = (baseAvail === null) ? "—" : baseAvail;
+
+    const p = per[person] || { tasks:0, bugs:0, touched:0, spent:0, scope:0, closed:0, bugHours:0 };
+    p.touched = (touchedByPerson[person] ? touchedByPerson[person].size : 0);
+
+    const assign = assigned[person] || {tasks:0, bugs:0};
+    const utilization = (typeof available === "number" && available > 0)
+      ? round2_(p.spent / available * 100)
+      : "—";
+
+    const netBurn = round2_(p.spent - p.scope);
+    const bugHourRatio = p.spent ? round2_(p.bugHours / p.spent * 100) : 0;
+
+    out.push([
+      latestTs, person, sprintName,
+      assign.tasks, assign.bugs,
+      p.touched, round2_(p.spent), round2_(p.scope), netBurn, p.closed,
+      available, utilization, bugHourRatio
+    ]);
+  }
+
+  if (out.length) sh.getRange(MAIN_HEADER_ROW+1,1,out.length,headers.length).setValues(out);
+  applyPercentFormatsByHeader_("Daily Utilization", ["Utilization %","Bug Hour Ratio %"], MAIN_HEADER_ROW);
+  applyNumberFormatsByHeader_("Daily Utilization", [
+    "Hours Spent (Since Prev Snapshot)","Scope Added (hrs)","Net Burn (hrs)","Tickets Closed (Today)","Available Hours (Today)"], MAIN_HEADER_ROW);
+}
+
+/** ============== AUTOMATION: single 2-hour orchestrator ============== **/
+
+function runEvery2h_SnapshotThenUtilization() {
+  snapshotRemainingLog_Current();
+  Utilities.sleep(4000);
+  runDailyUtilizationReport_Current();
+}
+
+function installEvery2hAutomation() {
+  const targets = new Set([
+    "runEvery2h_SnapshotThenUtilization",
+    "snapshotRemainingLog_Current",
+    "runDailyUtilizationReport_Current"
+  ]);
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (targets.has(t.getHandlerFunction())) ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger("runEvery2h_SnapshotThenUtilization").timeBased().everyHours(2).create();
+}
+
+function uninstallAutomation() {
+  const targets = new Set([
+    "runEvery2h_SnapshotThenUtilization",
+    "snapshotRemainingLog_Current",
+    "runDailyUtilizationReport_Current",
+    "runSprintReport_Current",
+    "onSprintSelectEdit"
+  ]);
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (targets.has(t.getHandlerFunction())) ScriptApp.deleteTrigger(t);
+  });
+}
+
+/** ============== Small utils ============== **/
+function enc(s){ return encodeURIComponent(s); }
+function escapeQuotes_(s){ return String(s).replace(/'/g, "''"); }
+function canonicalName_(s){ if(!s) return ""; return String(s).replace(/\s*<[^>]+>\s*$/, "").trim(); }
+function extractAssignee_(assigneeField){
+  let raw = "";
+  if (!assigneeField) return "";
+  if (typeof assigneeField === "string") raw = assigneeField;
+  else if (assigneeField.displayName)   raw = assigneeField.displayName;
+  else if (assigneeField.uniqueName)    raw = assigneeField.uniqueName;
+  return canonicalName_(raw);
+}
+function toNumber_(v){ const n = Number(v); return isNaN(n) ? 0 : n; }
+function pickNumber_(a,b){ const aa = toNumber_(a); return aa ? aa : toNumber_(b); }
+function toDateOrNull_(v){ if(!v) return null; const d = new Date(v); return isNaN(d.getTime()) ? null : d; }
+function asDateValue_(d){ return d ? new Date(d) : ""; }
+function todayMidnight_(){ const t = new Date(); t.setHours(0,0,0,0); return t; }
+function ymd_(d){ return d.getFullYear()*10000 + (d.getMonth()+1)*100 + d.getDate(); }
+function round2_(n){ return Math.round((n + Number.EPSILON)*100)/100; }
+function sortBy_(rows, colIndex){ return rows.sort((a,b)=>{ const x=(a[colIndex]||"").toString().toLowerCase(); const y=(b[colIndex]||"").toString().toLowerCase(); return x<y?-1:x>y?1:0; }); }
+function chunk_(arr, size){ const out=[]; for (let i=0;i<arr.length;i+=size) out.push(arr.slice(i, i+size)); return out; }
+function fmtDateKey_(d){ const y=d.getFullYear(); const m=String(d.getMonth()+1).padStart(2,"0"); const day=String(d.getDate()).padStart(2,"0"); return `${y}-${m}-${day}`; }
+function expandDateRange_(startISO, endISO){
+  if (!startISO || !endISO) return [];
+  const s = new Date(startISO), e = new Date(endISO);
+  s.setHours(0,0,0,0); e.setHours(0,0,0,0);
+  const out = [];
+  for (let d = new Date(s); d <= e; d = addDays_(d, 1)) out.push(new Date(d));
+  return out;
+}
+function isWeekday_(d){ const day = d.getDay(); return day !== 0 && day !== 6; }
+function addDays_(d,n){ const x = new Date(d); x.setDate(x.getDate()+n); return x; }
+
+function adoItemUrl_(id){
+  return `https://dev.azure.com/${enc(ADO_ORG)}/${enc(ADO_PROJECT_ID)}/_workitems/edit/${id}`;
+}
+function hyperlinkFormula_(url, text){
+  const safeText = String(text).replace(/"/g, '""');
+  return `=HYPERLINK("${url}","${safeText}")`;
+}
+
+/** ---------- Header helpers (header-aware) ---------- **/
+function headerIndexMap_(sh) { return headerIndexMapAt_(sh, 1); }
+function headerIndexMapAt_(sh, headerRow) {
+  const map = {};
+  if (!sh) return map;
+  const lastCol = sh.getLastColumn();
+  if (lastCol < 1) return map;
+  const headers = sh.getRange(headerRow, 1, 1, lastCol).getValues()[0];
+  headers.forEach((h, i) => { map[String(h).trim()] = i; });
+  return map;
+}
+
+/** ---------- Remaining Log helpers ---------- **/
+function buildLastRemainingMap_(sh, H) {
+  const out = {};
+  const lastRow = sh.getLastRow();
+  if (lastRow < MAIN_HEADER_ROW+1) return out;
+
+  if (!H) H = headerIndexMapAt_(sh, MAIN_HEADER_ROW);
+  const idIdx = (H["Work Item ID"] != null) ? H["Work Item ID"] : 2;
+  const remainingIdx = (H["Remaining (hrs)"] != null) ? H["Remaining (hrs)"] : 5;
+
+  const range = sh.getRange(MAIN_HEADER_ROW+1, 1, lastRow-MAIN_HEADER_ROW, sh.getLastColumn()).getValues();
+  for (let i=0;i<range.length;i++) {
+    const row = range[i];
+    const id = String(row[idIdx] || "");
+    const rem = toNumber_(row[remainingIdx]);
+    if (!id) continue;
+    out[id] = rem; // last wins
+  }
+  return out;
+}
+
+/** ---------- NEW: Remaining resolver + text-format enforcer ---------- **/
+/**
+ * Resolve Remaining for both calculation and display.
+ * @param {any} remainingField  raw f["Microsoft.VSTS.Scheduling.RemainingWork"]
+ * @param {any} effort          numeric (or convertible) Effort/OriginalEstimate
+ * @param {string} state        work item state
+ * @returns {{ calc:number, display:(number|string), missing:boolean }}
+ */
+function resolveRemaining_(remainingField, effort, state) {
+  var s = (state || "").toString().trim().toLowerCase();
+  var completedLike = (s === "done") || COMPLETED_OVERRIDE_STATES.has(s);
+
+  function toNumRaw(v) { var n = Number(v); return isNaN(n) ? NaN : n; }
+  var remNum = toNumRaw(remainingField);
+  var effNum = toNumRaw(effort);
+
+  if (!isNaN(remNum) && remNum > 0) {
+    return { calc: remNum, display: round2_(remNum), missing: false };
+  }
+
+  if (!isNaN(remNum) && remNum === 0) {
+    if (completedLike) return { calc: 0, display: 0, missing: false };
+    return { calc: (!isNaN(effNum) ? effNum : 0), display: "—", missing: true };
+  }
+
+  // null/empty/NaN
+  if (completedLike) return { calc: 0, display: 0, missing: false };
+  return { calc: (!isNaN(effNum) ? effNum : 0), display: "—", missing: true };
+}
+
+/**
+ * Sets a column to plain text ("@") by header name (avoids coercing the em dash).
+ */
+function enforceTextFormatByHeader_(sheetName, headerName, headerRow) {
+  const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
+  if (!sh) return;
+  const H = headerIndexMapAt_(sh, headerRow || 1);
+  const idx = H[headerName];
+  const lastRow = sh.getLastRow();
+  if (idx == null || lastRow <= (headerRow || 1)) return;
+  sh.getRange((headerRow||1)+1, idx+1, lastRow-(headerRow||1), 1).setNumberFormat("@");
+}
+
+/** ---------- Debug helper (lists projects) ---------- **/
+function listAdoProjects_LogOnly() {
+  const url = `https://dev.azure.com/${encodeURIComponent(ADO_ORG)}/_apis/projects?api-version=7.1-preview.4`;
+  const resp = UrlFetchApp.fetch(url, {
+    method: "GET",
+    headers: { "Authorization": "Basic " + Utilities.base64Encode(":" + ADO_PAT) }
+  });
+  const data = JSON.parse(resp.getContentText());
+  Logger.log(JSON.stringify(data.value, null, 2));
+}
